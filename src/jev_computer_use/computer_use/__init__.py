@@ -1,0 +1,1 @@
+"""computer_use — CPU-first GUI agent: capture → OCR parse → Jev decide → act → verify → escalate."""
