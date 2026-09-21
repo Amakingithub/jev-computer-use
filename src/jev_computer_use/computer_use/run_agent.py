@@ -60,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--channel", action="append", default=[], choices=("typesafe", "cloudflare", "openrouter"),
                    help="restrict decision provider (repeatable)")
+    p.add_argument(
+        "--ocr",
+        default="rapid",
+        choices=("rapid", "windows", "glm", "merge", "auto"),
+        help="OCR engine: rapid (default, ONNX) | windows (WinRT, free, reads glyphs) | "
+             "glm (local vision OCR, optional) | merge (rapid + windows gap-fill) | auto (cascade)",
+    )
     p.add_argument("--json", action="store_true", help="JSON step log on stdout")
     return p
 
@@ -79,6 +86,15 @@ def _confirm(prompt: str) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Console on this machine is cp1252; WinRT OCR reads CJK glyphs off-screen (menu icons,
+    # ime candidates). Guarantee no UnicodeEncodeError can kill the loop mid-run.
+    for _stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(_stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
     args = build_parser().parse_args(argv)
     region = _parse_region(args.region)
 
@@ -94,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         for step in range(1, args.max_steps + 1):
             log.info("step %d: capturing + parsing", step)
             shot = screen.capture(region)
-            elements = parse_ui.parse(shot.img)
+            elements = parse_ui.parse(shot.img, provider=args.ocr)
             inventory = parse_ui.state_text(elements)
             log.info("step %d: %d elements detected; deciding", step, len(elements))
             try:
@@ -109,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
                 "step": step,
                 "elements": len(elements),
                 "inventory": inventory or "(empty)",
+                "ocr_provider": args.ocr,
                 "action": plan.action,
                 "element_id": plan.element_id,
                 "confidence": plan.action_confidence,

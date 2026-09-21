@@ -17,6 +17,17 @@ computer-use = [
     "rapidocr-onnxruntime",
     "pyautogui",
 ]
+# FREE Windows built-in OCR (WinRT). Local, no model download, no API key.
+# Recovery tier when rapidocr is unavailable / to catch glyph tokens rapid misses.
+ocr-windows = [
+    "winrt-Windows.Media.Ocr",
+    "winrt-Windows.Globalization",
+    "winrt-Windows.Graphics.Imaging",
+    "winrt-Windows.Storage",
+    "winrt-Windows.Storage.Streams",
+    "winrt-Windows.Foundation",
+    "winrt-runtime",
+]
 dev = [
     "ruff",
     "pytest",

@@ -25,8 +25,8 @@ capture → parse → decide (Jev) → act → verify → escalate
 - `dhash(image, size=8)` → 64-bit perceptual hash; `hamming(prev, cur)` → screen-change score.
 - Used for both state input and **change verification**.
 
-### 2. Parse — `parse_ui.py`
-- **RapidOCR** (ONNX CPU, ~0.2 s) → elements `{id, text, box(x1,y1,x2,y2), center, conf}`.
+### 2. Parse — `parse_ui.py` (multi-provider OCR layer, 2026-09-22)
+- **RapidOCR** (ONNX CPU, ~0.2 s) → elements `{id, text, box(x1,y1,x2,y2), center, conf, source}`.
 - Render an **element inventory** consumed by Jev:
   ```
   1. "Open" @ (230,180)
@@ -35,6 +35,18 @@ capture → parse → decide (Jev) → act → verify → escalate
   ```
 - Cap ~40 elements (Jev Choice ≤255). Because OCR gives the *boxes*, Jev and any downstream VLM only
   ever reference element **ids** — no coordinate hallucination, no pixel access needed.
+
+**Providers** (`move parse_ui.parse(..., provider=...)`):
+| provider | engine | cost / notes |
+|---|---|---|
+| `rapid` (default) | RapidOCR ONNX | ~0.2 s, free, local |
+| `windows` | WinRT `Windows.Media.Ocr` | **free, local, zero-download, zero API key**; reads glyph tokens ONNX misses (`+`, `-`, `=`, CJK). Needs `pip install winrt-Windows.Media.Ocr winrt-Windows.Globalization winrt-Windows.Graphics.Imaging winrt-Windows.Storage winrt-Windows.Storage.Streams winrt-Windows.Foundation winrt-runtime` (all 3.2.1) — packaged as the `ocr-windows` extra (`uv pip install -e ".[ocr-windows]"`). Ships en-US + fr-FR recognizers on this machine. |
+| `glm` | `glmocr` (PaddleOCR, optional) | heavier; import-guarded so absence never breaks the role back |
+| `merge` | rapid primary + **windows gap-fill** | merge windows words that neither duplicate rapid text nor overlap a rapid box by `_overlap_ratio`; dedup keeps ids stable |
+| `auto` | cascade rapid → windows → glm | first provider that yields ≥1 element wins |
+
+Every provider degrades to a graceful `OcrError` message that names the missing engine and the exact
+install command; the loop never hard-crashes on a missing OCR tier.
 
 ### 3. Decide — `decide.py` + `questions_computer_use.py`
 One batched Jev call per step (speculative fan-out):
@@ -102,7 +114,10 @@ localhost:8081). Jev stays the router; the VLM only does what needs vision or pr
 
 | Component | Choice here | Why |
 |---|---|---|
-| OCR | RapidOCR (ONNX CPU) | ~0.2 s/frame; Apache-2.0; no GPU needed |
+| OCR (cheap tier) | RapidOCR (ONNX CPU) | ~0.2 s/frame; Apache-2.0; no GPU needed |
+| OCR (cheap glyph tier) | WinRT `Windows.Media.Ocr` (`--ocr windows`/`merge`) | free + local + no API key; catches `+ − =` operator glyphs rapid misses |
+| OCR (escalation) | `glmocr` optional | heavier local PaddleOCR; escalate-only |
+| Object/icon detect (later) | OmniParser (YOLOv9-E) or GUI-Owl-1.5 | needs ONNX/DirectML; OmniParser weights AGPL → personal use only |
 | Object/icon detect (later) | OmniParser (YOLOv9-E) or GUI-Owl-1.5 | needs ONNX/DirectML; OmniParser weights AGPL → personal use only |
 | Decision | Jev (cascade) | ~0.1 s, ~$0.0004/step, calibrated |
 | Open-ended semantics | free cloud VLM / `local-vision` | no local 7B possible (2 GB VRAM, CPU-only) |
