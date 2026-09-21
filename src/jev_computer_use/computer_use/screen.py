@@ -21,8 +21,13 @@ class Shot:
     region: Region | None = None
 
 
-def _dhash(img: Image.Image, size: int = 8) -> int:
-    """Perceptual hash: compare neighbouring pixels per row. 64-bit."""
+def _dhash(img: Image.Image, size: int = 16) -> int:
+    """Perceptual hash: compare neighbouring pixels per row. 256-bit by default.
+
+    16x16 (256 bits) so subtle changes in a mostly-blank editor register:
+    an 8x8 hash was so coarse that typing a single word on a 1920x1080 screen
+    could flip < 2 bits and be mis-classified as "no change" (2026-09-21).
+    """
     gray = img.convert("L").resize((size + 1, size), RESAMPLE)
     px = gray.load()
     h = 0

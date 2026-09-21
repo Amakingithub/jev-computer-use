@@ -25,6 +25,23 @@ log = logging.getLogger("computer-use")
 LOGS_DIR = Path("logs")
 
 
+class _ArgPipe:
+    """Ordered per-step values for type/press content (delivered out-of-band, never from Jev).
+
+    CLI '--input-text Hello|World' → step 1 types 'Hello', step 2 types 'World'.
+    A step that runs out of values escalates instead of resending the last one.
+    """
+
+    def __init__(self, raw: str | None) -> None:
+        self._items = [v for v in (raw.split("|") if raw else []) if v]
+
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
+    def take(self) -> str | None:
+        return self._items.pop(0) if self._items else None
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="jev-computer-use",
@@ -37,8 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=qc.MAX_STEPS)
     p.add_argument("--delay", type=float, default=qc.STEP_DELAY, help="seconds between action and verify")
     p.add_argument("--region", help="x1,y1,x2,y2 (absolute screen coords) to watch")
-    p.add_argument("--input-text", help="text to type when next_action=type_text")
-    p.add_argument("--press-key", help="key to press when next_action=press_key (e.g. Enter)")
+    p.add_argument("--input-text", help="text to type when next_action=type_text ('|' separates per-step values)")
+    p.add_argument(
+        "--press-key", help="key to press when next_action=press_key, e.g. Enter; '|' separates per-step values"
+    )
     p.add_argument("--channel", action="append", default=[], choices=("typesafe", "cloudflare", "openrouter"),
                    help="restrict decision provider (repeatable)")
     p.add_argument("--json", action="store_true", help="JSON step log on stdout")
@@ -65,8 +84,11 @@ def main(argv: list[str] | None = None) -> int:
 
     providers = [p for p in DecisionLayer._default_providers() if not args.channel or p.name in args.channel]
     layer = DecisionLayer(providers=providers)
+    text_pipe = _ArgPipe(args.input_text)
+    key_pipe = _ArgPipe(args.press_key)
     LOGS_DIR.mkdir(exist_ok=True)
     step_log: list[dict] = []
+    history: list[dict] = []
 
     try:
         for step in range(1, args.max_steps + 1):
@@ -76,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
             inventory = parse_ui.state_text(elements)
             log.info("step %d: %d elements detected; deciding", step, len(elements))
             try:
-                plan = decide.decide_plan(layer, args.goal, elements)
+                plan = decide.decide_plan(layer, args.goal, elements, history=history)
             except NoProviderAvailable as exc:
                 msg = f"step {step}: no decision provider available. Put keys in .env, then retry.\n{exc}"
                 log.error(msg)
@@ -97,6 +119,16 @@ def main(argv: list[str] | None = None) -> int:
                 "model": plan.model,
             }
             step_log.append(entry)
+            history.append(
+                {
+                    "step": step,
+                    "action": plan.action,
+                    "element": plan.element_id,
+                    "safe": plan.safe,
+                    "risk": plan.risk,
+                }
+            )
+            history = history[-8:]  # keep the last 8 steps visible to the model
             print(f"[{step}] action={plan.action} element#{plan.element_id} conf={plan.action_confidence:.2f} "
                   f"safe={plan.safe} risk={plan.risk} ({plan.reason})")
 
@@ -121,6 +153,17 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 target = elem.center
 
+            text = text_pipe.take() if plan.action == "type_text" else None
+            key = key_pipe.take() if plan.action == "press_key" else None
+            if plan.action == "type_text" and text is None:
+                print("escalate: type_text needs --input-text (no value supplied for this step)")
+                entry["verify"] = {"error": "no input-text value left"}
+                break
+            if plan.action == "press_key" and key is None:
+                print("escalate: press_key needs --press-key for this step")
+                entry["verify"] = {"error": "no press-key value left"}
+                break
+
             if args.approval == "confirm" or plan.needs_confirm or (plan.risk or 0) >= qc.RISK_CONFIRM:
                 if not _confirm(f"  act: {plan.action} on {target or 'viewport'}? (conf={plan.action_confidence:.2f}, "
                                 f"risk={plan.risk})"):
@@ -129,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
                     break
 
             before = shot.dhash
-            act.execute(plan.action, target, args.input_text, args.press_key)
+            act.execute(plan.action, target, text, key)
             time.sleep(args.delay)
             after = screen.capture(region)
             diff = screen.hamming(before, after.dhash)

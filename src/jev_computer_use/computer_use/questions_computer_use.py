@@ -6,11 +6,16 @@ model output, and are NOT shared across question types.
 from __future__ import annotations
 
 # --- decision gates (tune only after measuring agreement on your own logs) ---
-SAFE_NOUL = 0.70          # safe_to_proceed noul must be >= this to act
+# SAFE_NOUL calibration note 2026-09-21 (live, official channel, blank-Notepad demo):
+# a *benign* single step (type_text into a focused empty editor) measured noul 0.59-0.66
+# (0.61 generic prompt, 0.65 step-scoped prompt). 0.70 rejected it every time; 0.60 is a
+# calibrated floor — genuinely destructive steps score far lower (send/delete/pay ≈ 0.0-0.3),
+# and the per-step confirm + action_confidence + dHash stuck checks still apply on top.
+SAFE_NOUL = 0.60          # safe_to_proceed noul must be >= this to act
 ACTION_CONF = 0.60        # next_action confidence >= this to act without escalation
 RISK_CONFIRM = 3          # step_risk score >= this forces --approval confirm if not already
 MAX_STEPS = 10            # hard loop cap
-STUCK_DHASH = 2           # dhash bits below which = "no change" after an action
+STUCK_DHASH = 4           # dhash bits below which = "no change" (256-bit hash); tuned 2026-09-21
 STUCK_TRIES = 3           # consecutive no-change actions before we declare stuck
 STEP_DELAY = 0.8          # seconds between action and verification capture
 

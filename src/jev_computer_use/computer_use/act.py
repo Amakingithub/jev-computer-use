@@ -16,12 +16,17 @@ def double_click(center: tuple[int, int]) -> None:
     pyautogui.doubleClick(*center)
 
 
-def type_text(text: str, interval: float = 0.0) -> None:
+def type_text(text: str, interval: float = 0.05) -> None:
+    # small per-char interval: typewrite at interval=0 drops characters on app startup (2026-09-21)
     pyautogui.typewrite(text, interval=interval)
 
 
 def press(key: str) -> None:
-    pyautogui.press(key)
+    if "+" in key:  # e.g. "ctrl+s" -> hotkey(ctrl, s)
+        parts = [k.strip() for k in key.split("+") if k.strip()]
+        pyautogui.hotkey(*parts)
+    else:
+        pyautogui.press(key)
 
 
 def hotkey(*keys: str) -> None:
@@ -35,8 +40,9 @@ def scroll(clicks: int = 1) -> None:
 def execute(action: str, center: tuple[int, int] | None, text: str | None, key: str | None) -> None:
     """Run one bounded action by name. Coordinates must come from OCR (never model output)."""
     if action == "click_element":
-        if center is None:
-            raise ValueError("click_element requires an element center")
+        if center is None:  # 'nonew' / viewport target -> click the screen centre (e.g. focus the editor)
+            w, h = pyautogui.size()
+            center = (w // 2, h // 2)
         click(center)
     elif action == "type_text":
         if text is None:

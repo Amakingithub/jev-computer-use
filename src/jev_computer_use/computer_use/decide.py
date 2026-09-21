@@ -40,10 +40,16 @@ def build_questions(
     options = {str(e.id): e.to_state_line() for e in elements}
     if not options:
         options = {"none": "no elements detected on screen"}
+    options["nonew"] = "act on the currently focused window (no element click needed)"
     qs = [
         choice(
             key="which_element",
-            instructions="Which screen element should this task act on?",
+            instructions=(
+                "Which screen element should this task act on? 'nonew' = act on the currently "
+                "focused window (right for typing or keyboard shortcuts, which do not need a "
+                "coordinate click). Pick a listed element only when the action must physically "
+                "target that UI control."
+            ),
             options=options,
         ),
         choice(
@@ -53,10 +59,18 @@ def build_questions(
         ),
         noul(
             key="safe_to_proceed",
-            instructions="It is safe to execute the chosen action automatically right now.",
+            instructions=(
+                "Executing ONLY the action chosen in 'next_action' (applied to the element chosen in 'which_element'), "
+                "starting right now, has no real downside and does not need a human watching. Rate just this one step, "
+                "not the whole goal. Opening a menu or dialog (e.g. Ctrl+S opening a save dialog, Ctrl+V pasting text "
+                "into a field) is NOT a side effect — nothing is written to disk, sent, or deleted by the step itself."
+            ),
             criteria={
-                "true": "Executing this action has no destructive, persistent, or irreversible side effects",
-                "false": "It could damage, delete, send, spend, or irreversibly change something",
+                "true": "This one step is reversible/benign (typing, navigation keys, opening a dialog or menu)",
+                "false": (
+                    "This step itself deletes, overwrites an existing file, sends, pays, installs, launches a shell, "
+                    "or otherwise irreversibly changes state"
+                ),
             },
         ),
         score(
@@ -73,12 +87,14 @@ def decide_plan(
     goal: str,
     elements: list[Element],
     extra_instructions: str | None = None,
+    history: list[dict] | None = None,
 ) -> ActionPlan:
     inventory = state_text(elements) or "(no text detected on screen)"
     state = {
         "goal": goal,
         "screen_elements": inventory,
         "instructions": extra_instructions or "",
+        "previous_steps": history or [],
     }
     questions = build_questions(goal, inventory, elements, extra_instructions)
     resp = layer.ask(state, questions)
@@ -90,6 +106,8 @@ def decide_plan(
     elem_choice = answers.get("which_element")
     if elem_choice and elem_choice.choice and elem_choice.choice.isdigit():
         element_id = int(elem_choice.choice)
+    if elem_choice and elem_choice.choice in ("nonew", "none"):
+        element_id = None  # act on the focused window / viewport
     safe = bool(answers.get("safe_to_proceed") and answers["safe_to_proceed"].noul >= qc.SAFE_NOUL)
     risk = answers.get("step_risk") and answers["step_risk"].score
 
