@@ -8,9 +8,16 @@ Cheap-first by design, fitted to this CPU (i7-7500U — no local 7B+ model):
               ~0.4–0.9 s on this CPU.
 - `glm`     — GLM-OCR style local vision OCR (optional, heavier). Escalation/deep-read only,
               NOT the per-step path. Import-guarded; skipped unless the engine is installed.
-- `merge`   — rapid primary + windows gap-fill (dedupe by text). Recovers glyph-only tokens.
+- `a11y`    — Windows UIAutomation accessibility tree (free, local, comtypes). 0 vision tokens:
+              reads control Name + bounding rect straight from the OS. Catches icon-only
+              buttons and widgets OCR cannot see at all. ~0.1–0.5 s walk (depth/node caps).
+- `merge`   — rapid primary + windows + a11y gap-fill (dedupe by text/overlap).
 - `auto`    — first installed provider that returns ≥1 element, in cascade order
-              rapid → windows → glm.
+              rapid → windows → glm → a11y.
+
+a11y boxes are ABSOLUTE screen coords (WinRT/mss use the same 0,0 origin, so full-screen
+capture maps 1:1). For sub-region captures pass origin=(x1,y1) so a11y boxes are shifted
+into image-local coords exactly like OCR outputs.
 
 Element text + boxes feed the Jev state; Jev/VLMs only reference element *ids*, never pixels.
 """
@@ -43,6 +50,10 @@ _GRACE_WINDOWS = (
     "winrt-Windows.Storage winrt-Windows.Storage.Streams winrt-Windows.Foundation winrt-runtime"
 )
 _GRACE_GLM = "GLM-style OCR engine not installed (optional escalation provider)."
+_GRACE_A11Y = (
+    "Windows UIAutomation not installed. Run: uv pip install uiautomation  "
+    "(free, ships with Windows; also added as the 'uia11y' project extra)"
+)
 
 
 class OcrError(RuntimeError):
@@ -186,6 +197,121 @@ class GLMOcrProvider(BaseProvider):
         return reads
 
 
+# UIAutomation control types that make useful agent targets ("actable" widgets).
+_A11Y_ACTIONABLE = {
+    "ButtonControl",
+    "EditControl",
+    "ListItemControl",
+    "MenuItemControl",
+    "CheckBoxControl",
+    "RadioButtonControl",
+    "ComboBoxControl",
+    "TabItemControl",
+    "HyperlinkControl",
+    "SliderControl",
+    "TreeItemControl",
+    "CustomControl",
+}
+_A11Y_MAX_DEPTH = 6
+_A11Y_MAX_NODES = 400
+_A11Y_MAX_SECONDS = 2.0  # wall-clock budget: a stuck/hung window must not freeze the loop
+
+
+def _uia11y_reads(origin: RawBox = (0, 0)) -> list[RawRead]:
+    """Walk the UIAutomation tree for actionable controls → (Name, abs_box, 1.0).
+
+    Boxes come back in ABSOLUTE screen coords; `origin` is the capture-region origin
+    (x1, y1) to shift into image-local coordinates. Pure COM reads — zero vision cost,
+    which is exactly the injury a screen-reader ground truth fixes for icon-only buttons.
+    A node cap + wall-clock budget keep the walk bounded on a CPU-first box.
+    """
+    try:
+        import uiautomation as uia
+    except ImportError:  # pragma: no cover - optional dep
+        raise OcrError(_GRACE_A11Y) from None
+
+    import time as _time
+
+    started = _time.perf_counter()
+    ctx = {"root": uia.GetRootControl(), "reads": [], "seen": set(), "nodes": 0}
+
+    def emit(text: str, box: RawBox) -> None:
+        # UIA walks both the caption-window and its content tree → identical controls
+        # (same text + same box) can appear twice; collapse to one read.
+        key = (text, box)
+        if key in ctx["seen"]:
+            return
+        ctx["seen"].add(key)
+        ctx["reads"].append((text, box, 1.0))
+
+    def visit(ctrl, depth: int) -> None:
+        if (ctx["nodes"] >= _A11Y_MAX_NODES
+                or depth > _A11Y_MAX_DEPTH
+                or _time.perf_counter() - started > _A11Y_MAX_SECONDS):
+            return
+        ctx["nodes"] += 1
+        try:
+            offscreen = bool(ctrl.IsOffscreen)
+            rect = ctrl.BoundingRectangle
+        except Exception:  # pragma: no cover - flaky COM element
+            return
+        if offscreen or rect is None:
+            return
+        x1, y1, x2, y2 = rect.left, rect.top, rect.right, rect.bottom
+        w, h = x2 - x1, y2 - y1
+        if w < 2 or h < 2:  # degenerate invisible box
+            return
+        ctype = getattr(ctrl, "ControlTypeName", "") or ""
+        if ctype in _A11Y_ACTIONABLE:
+            text = _safe_uia_name(getattr(ctrl, "Name", "") or "")
+            if text:
+                ox, oy = origin
+                emit(text, (int(x1 - ox), int(y1 - oy), int(x2 - ox), int(y2 - oy)))
+        try:
+            for child in ctrl.GetChildren():
+                visit(child, depth + 1)
+        except Exception:  # pragma: no cover - flaky COM walk
+            return
+
+    try:
+        for top in ctx["root"].GetChildren():
+            visit(top, 1)
+    except Exception:  # pragma: no cover - desktop root glitch
+        pass
+    return ctx["reads"]
+
+
+def _safe_uia_name(raw: str) -> str:
+    """UIA names can hold multibyte accessor/whitespace junk; keep it printable."""
+    if raw is None:
+        return ""
+    return " ".join(raw.split()).strip()
+
+
+class A11yUIAProvider(BaseProvider):
+    """Windows UIAutomation (uiautomation wrapper on comtypes) — 0 vision tokens.
+
+    Unlike OCR providers it does not read pixels; it reads the OS accessibility tree.
+    Returns actionable controls (buttons, edits, list items…) with their accessible Name
+    and absolute bounding rect. Catches icon-only controls OCR cannot see at all.
+    """
+
+    name = "a11y"
+
+    def installed(self) -> bool:
+        try:
+            import importlib.util
+
+            return importlib.util.find_spec("uiautomation") is not None
+        except Exception:  # pragma: no cover - defensive
+            return False
+
+    def parse_boxes(self, img: Image.Image) -> list[RawRead]:  # img unused: UIA walks live tree
+        if not self.installed():
+            raise OcrError(_GRACE_A11Y)
+        return _uia11y_reads()
+
+
 def _rapid_available() -> bool:
     try:
         import importlib.util
@@ -252,6 +378,7 @@ def _registry() -> dict[str, BaseProvider]:
                 "rapid": RapidOCRProvider(),
                 "windows": WindowsOCRProvider(),
                 "glm": GLMOcrProvider(),
+                "a11y": A11yUIAProvider(),
             }
         )
     return _PROVIDERS
@@ -313,30 +440,50 @@ def _merge_gap_fill(primary: list[Element], secondary: list[Element], max_elemen
     return out
 
 
-def parse(img: Image.Image, max_elements: int = 40, provider: str = "rapid") -> list[Element]:
+def parse(
+    img: Image.Image,
+    max_elements: int = 40,
+    provider: str = "rapid",
+    origin: tuple[int, int] = (0, 0),
+) -> list[Element]:
     """OCR an image into an element inventory.
 
-    provider: 'rapid' (default) | 'windows' | 'glm' | 'merge' | 'auto'.
+    provider: 'rapid' (default) | 'windows' | 'glm' | 'a11y' | 'merge' | 'auto'.
+    origin:   (x1, y1) of the capture region in ABSOLUTE screen coords. Used only to
+              shift a11y boxes back into image-local coordinates; OCR boxes are already
+              image-local. Default (0,0) = full-screen capture (the common case).
     """
-    if provider not in ("rapid", "windows", "glm", "merge", "auto"):
-        raise OcrError(f"unknown OCR provider {provider!r}; known: rapid, windows, glm, merge, auto")
+    known = ("rapid", "windows", "glm", "a11y", "merge", "auto")
+    if provider not in known:
+        raise OcrError(f"unknown OCR provider {provider!r}; known: {', '.join(known)}")
+
+    def _run(name: str, cap: int | None = None) -> list[Element]:
+        p = get_provider(name)
+        if not p.installed():
+            raise OcrError(f"{name}: engine not installed")
+        if isinstance(p, A11yUIAProvider):
+            return _to_elements(_uia11y_reads(origin), source=name, max_elements=cap or max_elements)
+        return p.parse(img, max_elements=cap or max_elements)
 
     if provider == "merge":
-        primary = get_provider("rapid").parse(img, max_elements=max_elements)
-        if get_provider("windows").installed():
-            secondary = get_provider("windows").parse(img, max_elements=max_elements * 2)
-            return _merge_gap_fill(primary, secondary, max_elements=max_elements)
-        return primary
+        primary = _run("rapid")
+        secondary: list[Element] = []
+        for name in ("windows", "a11y"):
+            try:
+                secondary += _run(name, cap=max_elements * 2)
+            except OcrError:
+                continue
+        return _merge_gap_fill(primary, secondary, max_elements=max_elements)
 
     if provider == "auto":
         last_error: Exception | None = None
-        for name in ("rapid", "windows", "glm"):
+        for name in ("rapid", "windows", "glm", "a11y"):
             p = get_provider(name)
             if not p.installed():
                 last_error = OcrError(f"{name}: engine not installed")
                 continue
             try:
-                elements = p.parse(img, max_elements=max_elements)
+                elements = _run(name)
             except Exception as exc:  # pragma: no cover - provider runtime error
                 last_error = exc
                 continue
@@ -344,7 +491,7 @@ def parse(img: Image.Image, max_elements: int = 40, provider: str = "rapid") -> 
                 return elements
         raise OcrError(f"all OCR providers returned nothing ({last_error})") from last_error
 
-    return get_provider(provider).parse(img, max_elements=max_elements)
+    return _run(provider)
 
 
 def state_text(elements: list[Element]) -> str:

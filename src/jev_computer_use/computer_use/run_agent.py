@@ -63,9 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ocr",
         default="rapid",
-        choices=("rapid", "windows", "glm", "merge", "auto"),
+        choices=("rapid", "windows", "glm", "a11y", "merge", "auto"),
         help="OCR engine: rapid (default, ONNX) | windows (WinRT, free, reads glyphs) | "
-             "glm (local vision OCR, optional) | merge (rapid + windows gap-fill) | auto (cascade)",
+             "glm (local vision OCR, optional) | a11y (UIAutomation tree, 0 vision tokens) | "
+             "merge (rapid+windows+a11y gap-fill) | auto (cascade)",
     )
     p.add_argument("--json", action="store_true", help="JSON step log on stdout")
     return p
@@ -110,7 +111,8 @@ def main(argv: list[str] | None = None) -> int:
         for step in range(1, args.max_steps + 1):
             log.info("step %d: capturing + parsing", step)
             shot = screen.capture(region)
-            elements = parse_ui.parse(shot.img, provider=args.ocr)
+            origin = (region[0], region[1]) if region else (0, 0)
+            elements = parse_ui.parse(shot.img, provider=args.ocr, origin=origin)
             inventory = parse_ui.state_text(elements)
             log.info("step %d: %d elements detected; deciding", step, len(elements))
             try:

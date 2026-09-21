@@ -36,14 +36,22 @@ capture → parse → decide (Jev) → act → verify → escalate
 - Cap ~40 elements (Jev Choice ≤255). Because OCR gives the *boxes*, Jev and any downstream VLM only
   ever reference element **ids** — no coordinate hallucination, no pixel access needed.
 
+The a11y provider is the **text-free ground truth**: it reads the OS accessibility tree, not pixels,
+so it sees actionable controls (buttons, edits, list items) with their accessible Name and absolute
+rect exactly as the screen reader would. It closes the biggest blind spot of a pixel-only-first loop —
+icon-only controls whose glyphs no OCR engine can decode. Verified on this machine: Calculator's
+blue `+`/`−`/`=` keys come through as `Plus`/`Minus`/`Equals` at their real screen coordinates
+(~1.0 s with node/depth/time caps).
+
 **Providers** (`move parse_ui.parse(..., provider=...)`):
 | provider | engine | cost / notes |
 |---|---|---|
 | `rapid` (default) | RapidOCR ONNX | ~0.2 s, free, local |
 | `windows` | WinRT `Windows.Media.Ocr` | **free, local, zero-download, zero API key**; reads glyph tokens ONNX misses (`+`, `-`, `=`, CJK). Needs `pip install winrt-Windows.Media.Ocr winrt-Windows.Globalization winrt-Windows.Graphics.Imaging winrt-Windows.Storage winrt-Windows.Storage.Streams winrt-Windows.Foundation winrt-runtime` (all 3.2.1) — packaged as the `ocr-windows` extra (`uv pip install -e ".[ocr-windows]"`). Ships en-US + fr-FR recognizers on this machine. |
+| `a11y` | Windows UIAutomation tree (comtypes) | **0 vision tokens**: actionable control Name + absolute rect straight from the OS. Catches icon-only buttons OCR cannot see at all (Calculator's `+`/`=` read as `Plus`/`Equals`). Bounded by node/depth/time caps (~1 s). `uv pip install -e ".[uia11y]"`. Boxes are absolute screen coords — must pass `origin=(x1,y1)` for sub-region captures. |
 | `glm` | `glmocr` (PaddleOCR, optional) | heavier; import-guarded so absence never breaks the role back |
-| `merge` | rapid primary + **windows gap-fill** | merge windows words that neither duplicate rapid text nor overlap a rapid box by `_overlap_ratio`; dedup keeps ids stable |
-| `auto` | cascade rapid → windows → glm | first provider that yields ≥1 element wins |
+| `merge` | rapid + windows + **a11y gap-fill** | gap-fill by text/IoU overlap through all three free tiers; operator keys end up on the inventory |
+| `auto` | cascade rapid → windows → glm → a11y | first provider that yields ≥1 element wins |
 
 Every provider degrades to a graceful `OcrError` message that names the missing engine and the exact
 install command; the loop never hard-crashes on a missing OCR tier.
@@ -116,6 +124,7 @@ localhost:8081). Jev stays the router; the VLM only does what needs vision or pr
 |---|---|---|
 | OCR (cheap tier) | RapidOCR (ONNX CPU) | ~0.2 s/frame; Apache-2.0; no GPU needed |
 | OCR (cheap glyph tier) | WinRT `Windows.Media.Ocr` (`--ocr windows`/`merge`) | free + local + no API key; catches `+ − =` operator glyphs rapid misses |
+| Text-free ground truth | UIAutomation tree (`--ocr a11y`/`merge`) | 0 vision tokens; actionable Name + rect from the OS; reads icon-only buttons OCR can't see (Calculator `Plus`/`Equals`) |
 | OCR (escalation) | `glmocr` optional | heavier local PaddleOCR; escalate-only |
 | Object/icon detect (later) | OmniParser (YOLOv9-E) or GUI-Owl-1.5 | needs ONNX/DirectML; OmniParser weights AGPL → personal use only |
 | Object/icon detect (later) | OmniParser (YOLOv9-E) or GUI-Owl-1.5 | needs ONNX/DirectML; OmniParser weights AGPL → personal use only |

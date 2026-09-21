@@ -44,7 +44,7 @@ def test_unknown_provider_raises() -> None:
 
 
 def test_registry_contains_all_names() -> None:
-    for name in ("rapid", "windows", "glm"):
+    for name in ("rapid", "windows", "glm", "a11y"):
         p = get_provider(name)
         assert p.name == name
 
@@ -53,6 +53,7 @@ def test_available_providers_only_installed() -> None:
     names = available_providers()
     assert isinstance(names, list)
     assert "rapid" in names  # rapidocr installed in this venv by test setup
+    assert "a11y" in names  # uiautomation installed in this venv by test setup
     # glm is a stub with a non-existent module → must never report available
     assert "glm" not in names
 
@@ -84,6 +85,31 @@ def test_merge_gap_fill_respects_cap() -> None:
     ]
     merged = _merge_gap_fill([primary], secondary, max_elements=3)
     assert len(merged) == 3
+
+
+def test_uia11y_reads_shifts_by_origin() -> None:
+    """a11y boxes are ABSOLUTE screen coords; parse(origin=...) must shift them to image-local."""
+    import jev_computer_use.computer_use.parse_ui as pu
+
+    fake = [(("Add", (100, 200, 120, 220), 1.0))]
+    calls: list[tuple[int, int]] = []
+
+    def fake_reads(origin):
+        calls.append(origin)
+        ox, oy = origin
+        return [(t, (x1 - ox, y1 - oy, x2 - ox, y2 - oy), s) for (t, (x1, y1, x2, y2), s) in fake]
+
+    orig = pu._uia11y_reads
+    pu._uia11y_reads = fake_reads
+    try:
+        els = pu.parse(Image.new("RGB", (10, 10)), provider="a11y", origin=(50, 60))
+        assert calls == [(50, 60)]
+        assert len(els) == 1
+        assert els[0].text == "Add"
+        assert els[0].box == (50, 140, 70, 160)  # abs (100,200)-(120,220) minus origin (50,60)
+        assert els[0].source == "a11y"
+    finally:
+        pu._uia11y_reads = orig
 
 
 def test_state_text_multiline() -> None:

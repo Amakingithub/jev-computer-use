@@ -17,6 +17,11 @@ computer-use = [
     "rapidocr-onnxruntime",
     "pyautogui",
 ]
+# FREE Windows UIAutomation tree read (comtypes). 0 vision tokens: control Name + rect
+# straight from the OS. Catches icon-only buttons OCR cannot see at all.
+uia11y = [
+    "uiautomation",
+]
 # FREE Windows built-in OCR (WinRT). Local, no model download, no API key.
 # Recovery tier when rapidocr is unavailable / to catch glyph tokens rapid misses.
 ocr-windows = [
