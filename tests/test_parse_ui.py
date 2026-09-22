@@ -30,6 +30,19 @@ def test_to_elements_skips_empty_text() -> None:
     assert [e.text for e in _to_elements(reads, source="x", max_elements=10)] == ["ok"]
 
 
+def test_to_elements_sorts_by_position_for_stable_ids() -> None:
+    # read order is arbitrary but ids must follow (top, left, text) so a re-capture of an
+    # unchanged screen yields the SAME ids (Jev target stability, 2026-09-22).
+    reads = [
+        ("Z", (160, 0, 170, 10), 0.9),  # same row as A but further right → id 2
+        ("A", (0, 0, 10, 10), 0.9),
+        ("B", (0, 30, 10, 40), 0.9),    # row below → id 4
+        ("na", (0, 15, 10, 25), 0.9),   # row between A and B → id 3
+    ]
+    els = _to_elements(reads, source="rapid", max_elements=10)
+    assert [(e.id, e.text) for e in els] == [(1, "A"), (2, "Z"), (3, "na"), (4, "B")]
+
+
 def test_unknown_provider_raises() -> None:
     try:
         get_provider("nope")
@@ -94,7 +107,7 @@ def test_uia11y_reads_shifts_by_origin() -> None:
     fake = [(("Add", (100, 200, 120, 220), 1.0))]
     calls: list[tuple[int, int]] = []
 
-    def fake_reads(origin):
+    def fake_reads(origin, region=None):
         calls.append(origin)
         ox, oy = origin
         return [(t, (x1 - ox, y1 - oy, x2 - ox, y2 - oy), s) for (t, (x1, y1, x2, y2), s) in fake]

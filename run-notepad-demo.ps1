@@ -44,21 +44,22 @@ function Get-NotepadWindows {
 }
 
 $wins = Get-NotepadWindows
-$target = $wins | Where-Object { $_.Title -match "^Untitled" } | Select-Object -First 1
+$blankRe = "^(Untitled|Sans titre)"
+$target = $wins | Where-Object { $_.Title -match $blankRe } | Select-Object -First 1
 if (-not $target) {
     Write-Output "no blank window; opening a fresh Notepad"
     Start-Process notepad
     Start-Sleep -Seconds 2
-    $target = (Get-NotepadWindows) | Where-Object { $_.Title -match "^Untitled" } | Select-Object -First 1
+    $target = (Get-NotepadWindows) | Where-Object { $_.Title -match $blankRe } | Select-Object -First 1
 }
 
 if (-not $target) {
-    Write-Output "ERROR: no 'Untitled - Notepad' window found"
+    Write-Output "ERROR: no blank Notepad window found (titles seen: $((($wins + (Get-NotepadWindows)) | ForEach-Object { $_.Title }) -join ', '))"
     exit 1
 }
 
 Write-Output ("target: '" + $target.Title + "' hwnd=" + $target.Hwnd)
-Write-Output ("existing documents untouched: " + ((Get-NotepadWindows | Where-Object { $_.Title -notmatch "^Untitled" } | ForEach-Object { $_.Title }) -join ", "))
+Write-Output ("existing documents untouched: " + ((Get-NotepadWindows | Where-Object { $_.Title -notmatch $blankRe } | ForEach-Object { $_.Title }) -join ", "))
 
 # Content is delivered OUT-OF-BAND (Jev only decides; it never produces free text):
 # the first keystrokes are "Hello", the save dialog is fed from the clipboard.

@@ -85,6 +85,15 @@ RawBox = tuple[int, int, int, int]  # x1, y1, x2, y2 (absolute screen coords)
 RawRead = tuple[str, RawBox, float]  # (text, box, score)
 
 
+def _a11y_region(origin: tuple[int, int], img: Image.Image) -> RawBox | None:
+    """Absolute region bounds covered by an image-local capture. Full-screen captures
+    (origin 0,0) return None (= no filter — keep every on-screen control)."""
+    ox, oy = origin
+    if ox == 0 and oy == 0:
+        return None
+    return (ox, oy, ox + img.width, oy + img.height)
+
+
 class BaseProvider:
     name = "base"
 
@@ -217,13 +226,19 @@ _A11Y_MAX_NODES = 400
 _A11Y_MAX_SECONDS = 2.0  # wall-clock budget: a stuck/hung window must not freeze the loop
 
 
-def _uia11y_reads(origin: RawBox = (0, 0)) -> list[RawRead]:
+def _uia11y_reads(origin: RawBox = (0, 0), region: RawBox | None = None) -> list[RawRead]:
     """Walk the UIAutomation tree for actionable controls → (Name, abs_box, 1.0).
 
     Boxes come back in ABSOLUTE screen coords; `origin` is the capture-region origin
     (x1, y1) to shift into image-local coordinates. Pure COM reads — zero vision cost,
     which is exactly the injury a screen-reader ground truth fixes for icon-only buttons.
     A node cap + wall-clock budget keep the walk bounded on a CPU-first box.
+
+    `region` (x1,y1,x2,y2, absolute) OPTIONALLY filters the walk: any control whose box
+    does NOT overlap the region is dropped. Without it a `--region` capture still imports
+    every on-screen control (taskbar, tray, other windows overflow the inventory — verified
+    on Win11 with --region 40,0,575,808 pulling taskbar items at y=1050). Defaults to None
+    (= full-screen capture, keep everything).
     """
     try:
         import uiautomation as uia
@@ -244,6 +259,14 @@ def _uia11y_reads(origin: RawBox = (0, 0)) -> list[RawRead]:
         ctx["seen"].add(key)
         ctx["reads"].append((text, box, 1.0))
 
+    def in_region(rect) -> bool:
+        if region is None:
+            return True
+        rx1, ry1, rx2, ry2 = region
+        x1, y1, x2, y2 = rect.left, rect.top, rect.right, rect.bottom
+        # box must overlap the region to be importable
+        return not (x2 <= rx1 or y2 <= ry1 or x1 >= rx2 or y1 >= ry2)
+
     def visit(ctrl, depth: int) -> None:
         if (ctx["nodes"] >= _A11Y_MAX_NODES
                 or depth > _A11Y_MAX_DEPTH
@@ -260,6 +283,8 @@ def _uia11y_reads(origin: RawBox = (0, 0)) -> list[RawRead]:
         x1, y1, x2, y2 = rect.left, rect.top, rect.right, rect.bottom
         w, h = x2 - x1, y2 - y1
         if w < 2 or h < 2:  # degenerate invisible box
+            return
+        if not in_region(rect):
             return
         ctype = getattr(ctrl, "ControlTypeName", "") or ""
         if ctype in _A11Y_ACTIONABLE:
@@ -398,10 +423,12 @@ def available_providers() -> list[str]:
 
 def _to_elements(reads: list[RawRead], *, source: str, max_elements: int) -> list[Element]:
     elements: list[Element] = []
-    for i, (text, box, score) in enumerate(reads):
-        text = str(text).strip()
-        if not text or box is None:
-            continue
+    # Sort by (top, left, text) so ids are STABLE across re-captures of an unchanged
+    # screen: OCR/read detection order can jitter between frames, which shifted element
+    # ids and made Jev re-pick stale targets (2026-09-22 wizard test: conf 0.95→0.53).
+    valid = [(str(t).strip(), b, s) for (t, b, s) in reads if str(t).strip() and b is not None]
+    ordered = sorted(valid, key=lambda r: (r[1][1], r[1][0], r[0].lower()))
+    for i, (text, box, score) in enumerate(ordered):
         elements.append(Element(id=i + 1, text=text, box=box, score=float(score), source=source))
         if len(elements) >= max_elements:
             break
@@ -449,9 +476,11 @@ def parse(
     """OCR an image into an element inventory.
 
     provider: 'rapid' (default) | 'windows' | 'glm' | 'a11y' | 'merge' | 'auto'.
-    origin:   (x1, y1) of the capture region in ABSOLUTE screen coords. Used only to
-              shift a11y boxes back into image-local coordinates; OCR boxes are already
-              image-local. Default (0,0) = full-screen capture (the common case).
+    origin:   (x1, y1) of the capture region in ABSOLUTE screen coords. Used to (a) shift
+              a11y boxes back into image-local coordinates and (b) derive the capture
+              region bounds from the image size so the a11y walk only imports controls
+              actually inside the frame (no taskbar/tray overflow on --region captures).
+              OCR boxes are already image-local. Default (0,0) = full-screen capture.
     """
     known = ("rapid", "windows", "glm", "a11y", "merge", "auto")
     if provider not in known:
@@ -462,7 +491,8 @@ def parse(
         if not p.installed():
             raise OcrError(f"{name}: engine not installed")
         if isinstance(p, A11yUIAProvider):
-            return _to_elements(_uia11y_reads(origin), source=name, max_elements=cap or max_elements)
+            return _to_elements(_uia11y_reads(origin, region=_a11y_region(origin, img)),
+                                source=name, max_elements=cap or max_elements)
         return p.parse(img, max_elements=cap or max_elements)
 
     if provider == "merge":
