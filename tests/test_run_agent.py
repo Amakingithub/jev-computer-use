@@ -1,6 +1,9 @@
-"""Tests for the computer-use step pipes (offline)."""
+"""Tests for the computer-use step pipes + key guard (offline)."""
 from __future__ import annotations
 
+import pytest
+
+from jev_computer_use.computer_use.act import FocusLostError, validate_key
 from jev_computer_use.computer_use.parse_ui import Element
 from jev_computer_use.computer_use.run_agent import (
     _ArgPipe,
@@ -75,3 +78,24 @@ def test_parser_requires_exactly_one_of_goal_or_click_seq() -> None:
     assert p.parse_args(["--click-seq", "A|B"]).goal is None
     # both -> argparse allows (runtime gate in main), neither -> also allowed at parse time:
     # exclusivity is enforced in main() so tests cover it via _run_click_seq behaviour below.
+
+
+def test_validate_key_refuses_bare_win_super() -> None:
+    """A bare Win/Super press would open the Start menu (a CoreWindow nothing can close)."""
+    for bad in ("win", "super", "cmd", "windows", "lwin", "WIN"):
+        with pytest.raises(ValueError, match="Start menu"):
+            validate_key(bad)
+
+
+def test_validate_key_accepts_single_keys_and_chords() -> None:
+    assert validate_key("enter") == ("enter",)
+    assert validate_key("ctrl+s") == ("ctrl", "s")
+    assert validate_key("ctrl + shift + p") == ("ctrl", "shift", "p")
+    assert validate_key("win+shift+left") == ("win", "shift", "left")  # chord is fine
+
+
+def test_focus_lost_error_carries_typed_count() -> None:
+    exc = FocusLostError(typed=42, total=200)
+    assert exc.typed == 42
+    assert exc.total == 200
+    assert "42/200" in str(exc)

@@ -131,15 +131,64 @@ def _enum_top_windows(visit: Callable[[WindowInfo], None]) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+class AmbiguousWindowError(RuntimeError):
+    """More than one visible window matched `--window` — refusing instead of guessing.
+
+    drive-screen rule #4 (2026-09-22): "an ambiguous window match is a stop, not a guess".
+    On this desktop two Notepad documents / two Settings windows share near-identical
+    titles, and clicking the Z-order-first one is how text lands in the wrong document.
+    """
+
+    def __init__(self, pattern: str, candidates: list[WindowInfo]) -> None:
+        self.pattern = pattern
+        self.candidates = candidates
+        shown = "; ".join(f"{w.title!r} (hwnd={w.hwnd})" for w in candidates[:5])
+        more = f" (+{len(candidates) - 5} more)" if len(candidates) > 5 else ""
+        super().__init__(
+            f"window {pattern!r} is ambiguous — {len(candidates)} matches: {shown}{more}. "
+            "Pass a longer/more specific title (or use --region)."
+        )
+
+
 def find_window(pattern: str, enum: Callable | None = None) -> WindowInfo | None:
-    """Topmost visible window whose title matches `pattern`. None when not found."""
+    """Visible window uniquely matching `pattern`. None when not found.
+
+    Raises AmbiguousWindowError when several windows match (refuse, don't guess). A
+    single unambiguous match is returned regardless of Z-order."""
+
+    def _matches(w: WindowInfo) -> bool:
+        return title_matches(pattern, w.title)
+
     candidates: list[WindowInfo] = []
     iterator = enum or _enum_top_windows
     iterator(candidates.append)
-    for w in candidates:  # EnumWindows is Z-order: first match = topmost
-        if title_matches(pattern, w.title):
-            return w
-    return None
+    matches = [w for w in candidates if _matches(w)]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise AmbiguousWindowError(pattern, matches)
+    return matches[0]
+
+
+def foreground() -> int | None:
+    """HWND of the current foreground window, or None."""
+    hwnd = user32.GetForegroundWindow()
+    return int(hwnd) if hwnd else None
+
+
+def foreground_is(hwnd: int) -> bool:
+    """Does `hwnd` OWE the foreground right now? Proved immediately before acting, never
+    assumed from an older focus_window call (drive-screen rule #3, 2026-09-22)."""
+    return foreground() == int(hwnd)
+
+
+def get_dpi() -> int:
+    """System DPI (96 = no scaling). This process is DPI-aware, so all Win32 sticks on
+    physical pixels matching mss — doctor reports this so scaling never bites silently."""
+    try:
+        return int(ctypes.windll.user32.GetDpiForSystem())
+    except Exception:  # pragma: no cover - pre-1607 Windows
+        return 96
 
 
 def focus_window(hwnd: int, retries: int = 1) -> bool:

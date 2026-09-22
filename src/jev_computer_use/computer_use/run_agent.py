@@ -9,8 +9,10 @@ anything with step_risk >= RISK_CONFIRM force confirmation regardless. Run --dry
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -70,7 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
              "destructive/sensitive meaning (install, delete, accept, send, save...) force "
              "--approval confirm and are refused under --approval none.",
     )
-    p.add_argument("--input-text", help="text to type when next_action=type_text ('|' separates per-step values)")
+    p.add_argument(
+        "--input-text",
+        help="text for next_action=type_text/paste_text ('|' separates per-step values). "
+             "Prefer paste_text for punctuation-heavy/multi-line content (type_text mangles "
+             "special chars on rich editors, drive-screen lesson).",
+    )
     p.add_argument(
         "--press-key", help="key to press when next_action=press_key, e.g. Enter; '|' separates per-step values"
     )
@@ -160,16 +167,36 @@ class _WindowNotFound(RuntimeError):
         self.title = title
 
 
+def _refocus(hwnd: int | None, retries: int = 1) -> bool:
+    """True only when the intended window OWNS the foreground right before an act.
+
+    drive-screen rule #3 (2026-09-22): "never send input without confirming focus". Focus can
+    be stolen between the capture/parse and the act — the input then lands in a window the
+    agent cannot see and the dHash verify silently measures that window instead. Fast path is
+    one GetForegroundWindow syscall (~µs); only a stolen focus pays the refocus + settle.
+    """
+    if hwnd is None:
+        return True
+    if win32.foreground_is(hwnd):
+        return True
+    win32.focus_window(hwnd, retries=retries)
+    time.sleep(qc.STEP_DELAY)  # settle before re-check, same as _step_capture
+    return win32.foreground_is(hwnd)
+
+
 def _step_capture(args, static_region: screen.Region | None) -> tuple[
-        screen.Region | None, tuple[int, int], screen.Shot,
+        screen.Region | None, tuple[int, int], screen.Shot, int | None,
 ]:
     """Resolve --window (fresh every step: catches apps launched mid-run, window moves) or
-    --region, then capture. Raises _WindowNotFound when --window matches nothing."""
+    --region, then capture. Returns (region, origin, shot, hwnd). Raises _WindowNotFound when
+    --window matches nothing and AmbiguousWindowError when it matches several windows."""
+    hwnd: int | None = None
     if args.window:
         w = win32.find_window(args.window)
         if w is None:
             raise _WindowNotFound(args.window)
-        win32.focus_window(w.hwnd)
+        hwnd = w.hwnd
+        win32.focus_window(hwnd)
         # Let the window settle as the foreground target before we capture/click: a click
         # issued in the same instant as SetForegroundWindow is often swallowed (foreground
         # lock / DWM activation animation) — live 2026-09-22: click-seq step 1 diff=0,
@@ -180,7 +207,7 @@ def _step_capture(args, static_region: screen.Region | None) -> tuple[
     else:
         region = static_region
     origin = (region[0], region[1]) if region else (0, 0)
-    return region, origin, screen.capture(region)
+    return region, origin, screen.capture(region), hwnd
 
 
 def _run_click_seq(args, static_region: screen.Region | None, step_log: list[dict], seq: _ArgPipe) -> None:
@@ -201,11 +228,16 @@ def _run_click_seq(args, static_region: screen.Region | None, step_log: list[dic
         step += 1
         log.info("click-seq step %d: click %r", step, target)
         try:
-            region, origin, shot = _step_capture(args, static_region)
+            region, origin, shot, hwnd = _step_capture(args, static_region)
         except _WindowNotFound as exc:
             _dump_escalate(str(exc), "")
             step_log.append({"step": step, "target": target, "action": "click_element",
                              "confidence": 1.0, "reason": "window not found"})
+            return
+        except win32.AmbiguousWindowError as exc:
+            _dump_escalate(str(exc), "")
+            step_log.append({"step": step, "target": target, "action": "click_element",
+                             "confidence": 1.0, "reason": "window ambiguous"})
             return
         elements = parse_ui.parse(shot.img, provider=args.ocr, origin=origin)
         inventory = parse_ui.state_text(elements)
@@ -242,6 +274,14 @@ def _run_click_seq(args, static_region: screen.Region | None, step_log: list[dic
             return
 
         before = shot.dhash
+        if not _refocus(hwnd):
+            entry["verify"] = {"error": "focus lost before click"}
+            _dump_escalate(
+                f"window {args.window!r} no longer owns the foreground — refusing to click blind",
+                inventory,
+            )
+            step_log.append(entry)
+            return
         act.click(click_pt)
         time.sleep(args.delay)
         after = screen.capture(region)
@@ -262,6 +302,90 @@ def _run_click_seq(args, static_region: screen.Region | None, step_log: list[dic
     print(f"finished: max steps ({args.max_steps}) reached in click sequence")
 
 
+def _probe_providers() -> dict[str, bool]:
+    """Query each OCR provider's availability in an ISOLATED interpreter.
+
+    Ordering trap (found 2026-09-22, access-violation 0xC0000005): importing comtypes/UIAutomation
+    (the a11y provider) BEFORE onnxruntime segfaults onnxruntime's native init in this process.
+    Probing in a subprocess keeps the driver process pure: it only ever imports what it runs, so
+    no native-import order can bite the live loop. ~0.5-1.5 s, doctor-only.
+    """
+    code = (
+        "import json\n"
+        "from jev_computer_use.computer_use import parse_ui\n"
+        "out = {}\n"
+        "for n in ('rapid', 'windows', 'glm', 'a11y'):\n"
+        "    try:\n"
+        "        out[n] = bool(parse_ui.get_provider(n).installed())\n"
+        "    except Exception:\n"
+        "        out[n] = False\n"
+        "print(json.dumps(out))\n"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, timeout=60, text=True
+        )
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+        return {k: bool(v) for k, v in report.items()}
+    except Exception:
+        return {}
+
+
+def _run_doctor(argv: list[str]) -> int:
+    """Environment diagnostics before driving anything (drive-screen 'doctor' lesson).
+
+    Cheaper than debugging a silent no-op mid-run: DPI scale (the 2026-09-22 125% crop bug),
+    OCR engine availability, a real capture+parse, the clipboard, and the foreground query.
+    Run once per machine/session change, then drive.
+    """
+    p = argparse.ArgumentParser(prog="jev-computer-use doctor")
+    p.add_argument("--out", help="save a probe screenshot (PNG) to this path")
+    opts = p.parse_args(argv)
+
+    errors: list[str] = []
+
+    def report(label: str, ok: bool, detail: str = "") -> None:
+        if not ok and label not in errors:
+            errors.append(label)
+        suffix = f" — {detail}" if detail else ""
+        print(f"  {'ok' if ok else 'FAIL':4} {label}{suffix}")
+
+    print("== jev-computer-use doctor ==")
+
+    dpi = win32.get_dpi()
+    scale = f"{dpi / 96 * 100:.0f}%"
+    report("DPI (process is DPI-aware; win32/UIA/mss all physical)", dpi >= 96, f"GetDpiForSystem={dpi} ({scale})")
+    user32 = ctypes.WinDLL("user32")
+    print(f"  screen: {user32.GetSystemMetrics(0)}x{user32.GetSystemMetrics(1)} (physical)")
+
+    for name, ok in _probe_providers().items():
+        report(f"OCR provider {name}", ok, "(isolated subprocess — import-order-proof)")
+
+    try:
+        shot = screen.capture()
+        els = parse_ui.parse(shot.img, provider="rapid")
+        report("capture + rapid parse", True,
+               f"{shot.img.width}x{shot.img.height}; {len(els)} elements detected")
+        if opts.out:
+            shot.img.save(opts.out)
+            print(f"  probe saved: {opts.out}")
+    except Exception as exc:
+        report("capture + rapid parse", False, str(exc))
+
+    try:
+        saved = act.clipboard_snapshot()
+        report("clipboard read", True, f"content {'non-empty' if saved else 'empty'}")
+    except Exception as exc:
+        report("clipboard read", False, str(exc))
+
+    fg = win32.foreground()
+    report("foreground query", fg is not None, f"fg hwnd={fg}")
+
+    verdict = "all good" if not errors else f"PROBLEMS: {', '.join(errors)}"
+    print(f"== done: {verdict} ==")
+    return 1 if errors else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # Console on this machine is cp1252; WinRT OCR reads CJK glyphs off-screen (menu icons,
     # ime candidates). Guarantee no UnicodeEncodeError can kill the loop mid-run.
@@ -272,7 +396,10 @@ def main(argv: list[str] | None = None) -> int:
                 reconfigure(errors="replace")
             except (ValueError, OSError):
                 pass
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:]) if argv is None else list(argv)
+    if raw and raw[0] == "doctor":
+        return _run_doctor(raw[1:])
+    args = build_parser().parse_args(raw)
     static_region = _parse_region(args.region)
     if args.window and args.region:
         print("error: --window and --region are mutually exclusive", file=sys.stderr)
@@ -297,11 +424,16 @@ def main(argv: list[str] | None = None) -> int:
         for step in range(1, args.max_steps + 1):
             log.info("step %d: capturing + parsing", step)
             try:
-                region, origin, shot = _step_capture(args, static_region)
+                region, origin, shot, hwnd = _step_capture(args, static_region)
             except _WindowNotFound as exc:
                 _dump_escalate(str(exc), "")
                 step_log.append({"step": step, "window": args.window, "action": "escalate",
                                  "reason": "window not found"})
+                break
+            except win32.AmbiguousWindowError as exc:
+                _dump_escalate(str(exc), "")
+                step_log.append({"step": step, "window": args.window, "action": "escalate",
+                                 "reason": "window ambiguous"})
                 break
             elements = parse_ui.parse(shot.img, provider=args.ocr, origin=origin)
             inventory = parse_ui.state_text(elements)
@@ -362,11 +494,11 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 target = _abs(elem.center, origin)
 
-            text = text_pipe.take() if plan.action == "type_text" else None
+            text = text_pipe.take() if plan.action in ("type_text", "paste_text") else None
             key = key_pipe.take() if plan.action == "press_key" else None
-            if plan.action == "type_text" and text is None:
+            if plan.action in ("type_text", "paste_text") and text is None:
                 entry["verify"] = {"error": "no input-text value left"}
-                _dump_escalate("type_text needs --input-text (no value supplied for this step)", inventory)
+                _dump_escalate(f"{plan.action} needs --input-text (no value supplied for this step)", inventory)
                 break
             if plan.action == "press_key" and key is None:
                 entry["verify"] = {"error": "no press-key value left"}
@@ -380,8 +512,30 @@ def main(argv: list[str] | None = None) -> int:
                     entry["verify"] = {"aborted": True}
                     break
 
+            # drive-screen rule #3: prove the intended window still owns the foreground right
+            # before acting (fast path = one GetForegroundWindow; only a stolen focus pays).
+            if not _refocus(hwnd):
+                entry["verify"] = {"error": "focus lost before act"}
+                _dump_escalate(
+                    f"window {args.window!r} no longer owns the foreground — refusing to act blind",
+                    inventory,
+                )
+                break
+
             before = shot.dhash
-            act.execute(plan.action, target, text, key)
+            try:
+                act.execute(
+                    plan.action, target, text, key,
+                    focus_check=(lambda _hwnd=hwnd: win32.foreground_is(_hwnd)) if hwnd else None,
+                )
+            except act.FocusLostError as exc:
+                entry["verify"] = {"error": "focus_lost_midsend", "typed": exc.typed, "total": exc.total}
+                _dump_escalate(
+                    f"focus lost mid-{plan.action}: {exc.typed}/{exc.total} chars landed — screenshot "
+                    "before retrying (re-sending the whole string duplicates what arrived)",
+                    inventory,
+                )
+                break
             time.sleep(args.delay)
             after = screen.capture(region)
             diff = screen.hamming(before, after.dhash)

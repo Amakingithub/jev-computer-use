@@ -1,7 +1,14 @@
 """Tests for the Win32 window resolution layer (offline — fake EnumWindows)."""
 from __future__ import annotations
 
-from jev_computer_use.computer_use.win32 import WindowInfo, find_window, title_matches
+import pytest
+
+from jev_computer_use.computer_use.win32 import (
+    AmbiguousWindowError,
+    WindowInfo,
+    find_window,
+    title_matches,
+)
 
 
 def test_title_matches_case_and_diacritics() -> None:
@@ -26,21 +33,29 @@ def test_title_matches_rejects_unrelated() -> None:
     assert not title_matches("Calc", "OneNote")
 
 
-def test_find_window_topmost_first() -> None:
-    lower = [
-        WindowInfo(hwnd=101, title="Untitled - Notepad", pid=10, rect=(0, 0, 800, 600)),
-        WindowInfo(hwnd=202, title="Calculator", pid=11, rect=(0, 0, 400, 500)),
-    ]
+def test_find_window_ambiguous_refuses_not_guesses() -> None:
+    """Two windows matched -> AMBIGUOUS: stop and name the candidates (drive-screen rule #4)."""
+    notepad_a = WindowInfo(hwnd=101, title="Untitled - Notepad", pid=10, rect=(0, 0, 800, 600))
+    notepad_b = WindowInfo(hwnd=303, title="Bloc-notes - Sans titre", pid=12, rect=(0, 0, 700, 500))
+    calculator = WindowInfo(hwnd=202, title="Calculator", pid=11, rect=(0, 0, 400, 500))
 
     def fake_enum(visit):
-        for w in lower:
+        for w in (notepad_a, calculator, notepad_b):
             visit(w)
-        # a second Notepad deeper in Z-order under the Calculator must NOT win
-        visit(WindowInfo(hwnd=303, title="Bloc-notes - Untitled", pid=12, rect=(0, 0, 700, 500)))
 
-    got = find_window("notepad", enum=fake_enum)
+    with pytest.raises(AmbiguousWindowError) as exc_info:
+        find_window("notepad", enum=fake_enum)
+    assert len(exc_info.value.candidates) == 2
+    assert set(c.hwnd for c in exc_info.value.candidates) == {101, 303}
+
+
+def test_find_window_single_match_returns() -> None:
+    def fake_enum(visit):
+        visit(WindowInfo(hwnd=202, title="Calculator", pid=11, rect=(0, 0, 400, 500)))
+
+    got = find_window("calculatrice", enum=fake_enum)
     assert got is not None
-    assert got.hwnd == 101  # topmost visible match, not the later FR-titled one
+    assert got.hwnd == 202
 
 
 def test_find_window_missing() -> None:

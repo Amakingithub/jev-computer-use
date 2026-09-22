@@ -39,9 +39,13 @@ RISKY_CLICK_HINTS = (
 )
 
 # --- generic bounded action set (per goal, narrow it down) ---
+# paste_text = atomic clipboard paste (immune to layout/IME mangling). Prefer it for
+# punctuation-heavy or multi-line content — type_text mangles special chars on rich editors
+# (drive-screen live find: `test+^%~(){}[] 123` -> `test+^%~(333333333` in Win11 Notepad).
 DEFAULT_ACTIONS: dict[str, str] = {
     "click_element": "Click the selected element",
-    "type_text": "Type text into the selected element",
+    "type_text": "Type text into the selected element (short, layout-safe literals only)",
+    "paste_text": "Paste text at the cursor via the clipboard (atomic, keeps punctuation/multi-line intact)",
     "press_key": "Press a special key (Enter, Tab, Esc, Ctrl+S, ...)",
     "scroll": "Scroll the current view",
     "done": "The goal is complete",
@@ -51,10 +55,10 @@ DEFAULT_ACTIONS: dict[str, str] = {
 
 # Goal -> allowed action subset. Add rules here; the decide step only offers these options.
 GOAL_ACTION_MAP: dict[str, list[str]] = {
-    "form": ["click_element", "type_text", "press_key", "scroll", "done", "blocked", "escalate"],
-    "text": ["click_element", "type_text", "press_key", "scroll", "done", "blocked", "escalate"],
-    "browse": ["click_element", "type_text", "press_key", "scroll", "done", "blocked", "escalate"],
-    "default": ["click_element", "type_text", "press_key", "scroll", "done", "blocked", "escalate"],
+    "form": ["click_element", "type_text", "paste_text", "press_key", "scroll", "done", "blocked", "escalate"],
+    "text": ["click_element", "type_text", "paste_text", "press_key", "scroll", "done", "blocked", "escalate"],
+    "browse": ["click_element", "type_text", "paste_text", "press_key", "scroll", "done", "blocked", "escalate"],
+    "default": ["click_element", "type_text", "paste_text", "press_key", "scroll", "done", "blocked", "escalate"],
 }
 
 RISK_LEVELS = [
