@@ -36,12 +36,31 @@ def build_questions(
     inventory_text: str,
     elements: list[Element],
     extra_instructions: str | None = None,
+    available_actions: set[str] | None = None,
 ) -> list:
     options = {str(e.id): e.to_state_line() for e in elements}
     if not options:
         options = {"none": "no elements detected on screen"}
     options["__none__"] = "None of these elements would advance the goal (the needed control is absent or misread)"
     options["nonew"] = "act on the currently focused window (no element click needed)"
+    action_options = qc.actions_for(goal)
+    if available_actions is not None:
+        action_options = {a: d for a, d in action_options.items() if a in available_actions}
+    if not action_options:
+        # never present an empty choice space: retain the terminal/escape actions so the model
+        # can still signal completion, blockage or the need for a human.
+        action_options = {
+            a: d for a, d in qc.DEFAULT_ACTIONS.items() if a in ("done", "blocked", "escalate")
+        }
+    actions_instruction = (
+        "Which action should run next to make progress on the goal?"
+        if available_actions is None
+        else (
+            "Which action should run next to make progress on the goal? Only the actions listed "
+            "below are executable right now — actions needing text/keystrokes whose budget is "
+            "already spent are excluded, do NOT pick a type/paste/press action that is missing."
+        )
+    )
     qs = [
         choice(
             key="which_element",
@@ -57,8 +76,8 @@ def build_questions(
         ),
         choice(
             key="next_action",
-            instructions="Which action should run next to make progress on the goal?",
-            options=qc.actions_for(goal),
+            instructions=actions_instruction,
+            options=action_options,
         ),
         noul(
             key="task_done",
@@ -114,6 +133,7 @@ def decide_plan(
     elements: list[Element],
     extra_instructions: str | None = None,
     history: list[dict] | None = None,
+    available_actions: set[str] | None = None,
 ) -> ActionPlan:
     inventory = state_text(elements) or "(no text detected on screen)"
     state = {
@@ -122,7 +142,8 @@ def decide_plan(
         "instructions": extra_instructions or "",
         "previous_steps": history or [],
     }
-    questions = build_questions(goal, inventory, elements, extra_instructions)
+    questions = build_questions(goal, inventory, elements, extra_instructions,
+                                available_actions=available_actions)
     resp = layer.ask(state, questions)
     answers = resp.by_key()
 

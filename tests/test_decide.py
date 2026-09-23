@@ -1,7 +1,7 @@
 """Tests for the tiptour-driven decision gates (__none__ escape hatch, task_done/control_absent)."""
 from __future__ import annotations
 
-from jev_computer_use.computer_use.decide import decide_plan
+from jev_computer_use.computer_use.decide import build_questions, decide_plan
 from jev_computer_use.computer_use.parse_ui import Element
 from jev_computer_use.decision_layer import Answer, DecisionResponse
 
@@ -100,6 +100,27 @@ def test_omitted_gates_fail_safe() -> None:
     plan = decide_plan(FakeLayer(raws), "fill the form", ELEMENTS)
     assert plan.action == "click_element"
     assert plan.element_id == 1
+
+
+def test_available_actions_prunes_type_and_press_offers() -> None:
+    """Regression 2026-09-23 (stuck Notepad Save): with --input-text spent, type_text/paste_text
+    were still offered, Jev picked type_text on the Save As filename field, and the run dead-ended
+    'escalate' instead of clicking Save. The action space must be resource-aware."""
+    qs = build_questions("save the file", "(screen text)", ELEMENTS,
+                         available_actions={"click_element", "press_key", "done", "blocked", "escalate"})
+    action_q = next(q for q in qs if q.key == "next_action")
+    assert "type_text" not in action_q.criteria
+    assert "paste_text" not in action_q.criteria
+    assert "click_element" in action_q.criteria
+    assert "press_key" in action_q.criteria
+    assert "excluded" in action_q.instructions
+
+
+def test_available_actions_empty_input_keeps_terminal_actions() -> None:
+    """Even an empty pruned space must never produce a choice question with zero options."""
+    qs = build_questions("save the file", "(screen text)", ELEMENTS, available_actions=set())
+    action_q = next(q for q in qs if q.key == "next_action")
+    assert action_q.criteria  # non-empty (terminal actions retained by the caller filter)
 
 
 def test_empty_screen_still_offers_escape_and_nonew() -> None:

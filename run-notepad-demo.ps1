@@ -62,7 +62,7 @@ Write-Output ("target: '" + $target.Title + "' hwnd=" + $target.Hwnd)
 Write-Output ("existing documents untouched: " + ((Get-NotepadWindows | Where-Object { $_.Title -notmatch $blankRe } | ForEach-Object { $_.Title }) -join ", "))
 
 # Content is delivered OUT-OF-BAND (Jev only decides; it never produces free text):
-# the first keystrokes are "Hello", the save dialog is fed from the clipboard.
+# the first keystrokes are "Hello", the save dialog's filename is "n.txt".
 # VALIDATED 2026-09-21: the "File name" box takes a NAME only - a full path
 # (E:\tmp\n.txt) triggers Windows "file name is not valid ... special characters"
 # because of the backslashes. Steering the dialog to a specific folder is a
@@ -96,10 +96,10 @@ if ($fg -ne $target.Hwnd) {
 # --record/replay validation (see the replay line after the run).
 $rec = "$proj\demo-record-$(Get-Date -Format yyyyMMdd-HHmmss)"
 & "$proj\.venv\Scripts\python.exe" -m jev_computer_use.computer_use.run_agent `
-    --goal "in the foreground Notepad window, type Hello, then save the file (Save As, filename n.txt)" `
+    --goal "in the foreground Notepad window, type Hello, then save the file with Save As: open the save dialog (accept the suggested filename) and click the Save button" `
     --approval none `
     --input-text "Hello" `
-    --press-key "ctrl+s|ctrl+v|enter" `
+    --press-key "ctrl+s|enter" `
     --show-guide `
     --record $rec `
     --max-steps 12

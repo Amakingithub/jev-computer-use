@@ -133,9 +133,17 @@ def _parse_region(raw: str | None) -> screen.Region | None:
     return (parts[0], parts[1], parts[2], parts[3])
 
 
-def _confirm(prompt: str) -> bool:
-    answer = input(f"{prompt}  [y/N] ").strip().lower()
-    return answer in ("y", "yes")
+def _confirm(prompt: str) -> bool | None:
+    """Ask a human. Returns True/False for y/n, and None when there is NO human to ask
+    (stdin closed/EOF — hidden console, agent/subtask context). Never crashes the run;
+    the caller maps None to escalate (NEEDS_AGENT). isatty() is not reliable on Windows
+    (hidden ConPTY reports tty yet input() EOFs) hence the tri-state, 2026-09-23."""
+    try:
+        answer = input(f"{prompt}  [y/N] ").strip().lower()
+        return answer in ("y", "yes")
+    except EOFError:
+        log.warning("confirmation prompt got EOF (no interactive terminal)")
+        return None
 
 
 def _abs(center: tuple[int, int], origin: tuple[int, int]) -> tuple[int, int]:
@@ -776,7 +784,19 @@ def _drive_goal(args, layer: DecisionLayer, static_region: screen.Region | None,
                        status=_busy_status(args, step, elements, "deciding…"),
                        labels=[(e.id, e.text) for e in elements])
         try:
-            plan = decide.decide_plan(layer, args.goal, elements, history=history)
+            # Only actions that can actually execute are offered: when --input-text/--press-key
+            # budgets are spent (and no text-helper), type_text/paste_text/press_key would only
+            # abort as "needs --input-text". Pruning them lets Jev pick click_element (e.g. the
+            # real "Save" button in a Save As dialog) instead of dead-ending on an empty type.
+            # Live 2026-09-23: the Notepad Save run STOPPED at the Save dialog because step 4
+            # chose type_text (budget exhausted) and the escalates gate fired first.
+            allowed = set(qc.actions_for(args.goal))
+            if not text_pipe and not (args.text_helper and text_helper.configured()):
+                allowed -= {"type_text", "paste_text"}
+            if not key_pipe:
+                allowed -= {"press_key"}
+            plan = decide.decide_plan(layer, args.goal, elements, history=history,
+                                      available_actions=allowed)
         except NoProviderAvailable as exc:
             final_status = "error"
             last_reason = f"no decision provider available:\n{exc}"
@@ -828,7 +848,7 @@ def _drive_goal(args, layer: DecisionLayer, static_region: screen.Region | None,
             last_reason = plan.reason
             print(f"finished: blocked — {plan.reason}")
             break
-        if plan.escalate:
+        if plan.action == "escalate" or (plan.escalate and not plan.needs_confirm):
             final_status = "escalate"
             last_reason = plan.reason
             _dump_escalate(plan.reason, inventory)
@@ -904,8 +924,20 @@ def _drive_goal(args, layer: DecisionLayer, static_region: screen.Region | None,
                      _local(target, origin) if target else None, step, entry)
 
         if args.approval == "confirm" or plan.needs_confirm or (plan.risk or 0) >= qc.RISK_CONFIRM:
-            if not _confirm(f"  act: {plan.action} on {target or 'viewport'}? (conf={plan.action_confidence:.2f}, "
-                            f"risk={plan.risk})"):
+            answer = _confirm(f"  act: {plan.action} on {target or 'viewport'}? (conf={plan.action_confidence:.2f}, "
+                              f"risk={plan.risk})")
+            if answer is None:
+                # No human present (EOF on hidden/agent stdin). A step that warrants eyes must
+                # ESCALATE (NEEDS_AGENT), auto-refusing the step would dead-end real runs.
+                # Live 2026-09-23: a low-confidence type on the Save As filename field first
+                # crashed the hidden console (EOFError), then was mislabelled 'aborted by user'.
+                final_status = "escalate"
+                last_reason = f"{plan.action} warrants confirmation ({plan.reason}) but stdin is not a terminal"
+                entry["verify"] = {"error": last_reason}
+                _dump_escalate(f"{plan.action} needs eyes ({plan.reason}) — no interactive terminal, "
+                               "screenshot + VLM required", inventory)
+                break
+            if not answer:
                 final_status = "aborted"
                 last_reason = "user declined the action prompt"
                 print("aborted by user")
