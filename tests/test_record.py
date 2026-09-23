@@ -9,6 +9,7 @@ from jev_computer_use.computer_use.record import (
     assemble_gif,
     captions,
 )
+from jev_computer_use.computer_use.run_agent import _abs_box, _local
 
 
 def _img(w: int = 300, h: int = 200) -> Image.Image:
@@ -94,3 +95,18 @@ def test_captions_parses_jsonl_only_valid_lines(tmp_path):
 
 def test_captions_missing_file(tmp_path):
     assert captions(tmp_path / "nope") == []
+
+
+def test_abs_box_shifts_to_screen():
+    assert _abs_box((10, 20, 90, 60), (1920, 50)) == (1930, 70, 2010, 110)
+
+
+def test_abs_box_zero_origin_identity():
+    assert _abs_box((10, 20, 90, 60), (0, 0)) == (10, 20, 90, 60)
+
+
+def test_local_roundtrip_with_abs():
+    origin = (400, 150)
+    pt = _abs_box((10, 20, 90, 60), origin)
+    center = ((pt[0] + pt[2]) // 2, (pt[1] + pt[3]) // 2)
+    assert _local(center, origin) == (50, 40)

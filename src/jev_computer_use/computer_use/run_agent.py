@@ -151,6 +151,19 @@ def _abs(center: tuple[int, int], origin: tuple[int, int]) -> tuple[int, int]:
     return (cx + ox, cy + oy)
 
 
+def _abs_box(box: tuple[int, int, int, int], origin: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Image-local box → ABSOLUTE screen box (the full-screen overlay draws in screen coords)."""
+    x1, y1, x2, y2 = box
+    ox, oy = origin
+    return (x1 + ox, y1 + oy, x2 + ox, y2 + oy)
+
+
+def _local(point: tuple[int, int], origin: tuple[int, int]) -> tuple[int, int]:
+    """Screen point → image-local (record.py annotates the capture, which is origin-relative)."""
+    ox, oy = origin
+    return (point[0] - ox, point[1] - oy)
+
+
 def _dump_escalate(reason: str, inventory: str) -> None:
     """Print an escalation with the live screen inventory so the caller (agent / VLM)
     can re-plan WITHOUT a separate capture+parse round; upstream used to dead-end on a
@@ -570,13 +583,13 @@ def _run_click_seq(args, static_region: screen.Region | None, step_log: list[dic
         cbx1, cby1, cbx2, cby2 = click_box
         click_pt = _abs(((cbx1 + cbx2) // 2, (cby1 + cby2) // 2), origin)
         if guide.active:
-            guide.draw(frames=[e.box for e in elements], target=click_box,
+            guide.draw(frames=[_abs_box(e.box, origin) for e in elements], target=_abs_box(click_box, origin),
                        status=f"{_busy_status(args, step, elements, f'click-seq -> {target}')}",
                        cursor=click_pt,
                        labels=[(e.id, e.text) for e in elements])
         if record_dir:
             _record_step(record_dir, shot, elements, click_box,
-                         f"step {step} click-seq -> {target}", click_pt, step, entry)
+                         f"step {step} click-seq -> {target}", _local(click_pt, origin), step, entry)
         if risky and args.approval == "confirm":
             if not _confirm(f"  click {target!r} at {click_pt}? (destructive/sensitive class)"):
                 print("aborted by user")
@@ -621,6 +634,9 @@ def _run_click_seq(args, static_region: screen.Region | None, step_log: list[dic
                 return "blocked"
         else:
             stuck = 0
+        # #10: confirm-block — the clicked WORD stays green until the next plan draw.
+        if guide.active:
+            guide.flash(_abs_box(click_box, origin), f"✓ clicked {target!r} (diff={diff})", cursor=click_pt)
         step_log.append(entry)
     print(f"finished: max steps ({args.max_steps}) reached in click sequence")
     return "max_steps"
@@ -748,7 +764,7 @@ def _drive_goal(args, layer: DecisionLayer, static_region: screen.Region | None,
         inventory = parse_ui.state_text(elements)
         log.info("step %d: %d elements detected; deciding", step, len(elements))
         if guide.active:
-            guide.draw(frames=[e.box for e in elements], target=None,
+            guide.draw(frames=[_abs_box(e.box, origin) for e in elements], target=None,
                        status=_busy_status(args, step, elements, "deciding…"),
                        labels=[(e.id, e.text) for e in elements])
         try:
@@ -866,7 +882,8 @@ def _drive_goal(args, layer: DecisionLayer, static_region: screen.Region | None,
 
         if guide.active:
             guide.draw(
-                frames=[e.box for e in elements], target=plan_box,
+                frames=[_abs_box(e.box, origin) for e in elements],
+                target=_abs_box(plan_box, origin) if plan_box else None,
                 status=_busy_status(
                     args, step, elements,
                     f"plan: {plan.action} -> {target or 'viewport'} (conf={plan.action_confidence:.2f})"
@@ -875,7 +892,8 @@ def _drive_goal(args, layer: DecisionLayer, static_region: screen.Region | None,
                 labels=[(e.id, e.text) for e in elements],
             )
         _record_step(record_dir, shot, elements, plan_box,
-                     _busy_status(args, step, elements, f"plan: {plan.action}"), target, step, entry)
+                     _busy_status(args, step, elements, f"plan: {plan.action}"),
+                     _local(target, origin) if target else None, step, entry)
 
         if args.approval == "confirm" or plan.needs_confirm or (plan.risk or 0) >= qc.RISK_CONFIRM:
             if not _confirm(f"  act: {plan.action} on {target or 'viewport'}? (conf={plan.action_confidence:.2f}, "
@@ -960,6 +978,16 @@ def _drive_goal(args, layer: DecisionLayer, static_region: screen.Region | None,
             last_reason = f"stuck (no screen change after {qc.STUCK_TRIES} actions)"
             print(f"finished: blocked — {last_reason}")
             break
+
+        # #10 (after-action confirmation, 2026-09-23): the target stays GREEN while Jev
+        # thinks about the NEXT step — zero added latency (overlaps the ~1 s decide window)
+        # and the operator sees "that just happened", not only "what will happen next".
+        if guide.active:
+            summary = f"✓ {plan.action} (step {step}"
+            if plan.element_id:
+                summary += f", #{plan.element_id}"
+            guide.flash(_abs_box(plan_box, origin) if plan_box else None,
+                        f"{summary}, diff={diff})", cursor=target)
     else:
         final_status = "max_steps"
         last_reason = f"max steps ({args.max_steps}) reached without completion"

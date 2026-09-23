@@ -53,6 +53,9 @@ def _rgb(r: int, g: int, b: int) -> int:
 _BG = _rgb(255, 0, 255)          # magenta transparent key (unlikely in driven UIs)
 _FRAME = _rgb(0, 120, 255)        # inventory element frames (blue)
 _TARGET_FILL = _rgb(255, 230, 0)  # planned target block (amber)
+_TARGET_EDGE = _rgb(160, 0, 0)    # planned target outline (dark red)
+_FLASH_FILL = _rgb(0, 200, 120)   # after-action confirm block (green)
+_FLASH_EDGE = _rgb(0, 90, 50)     # after-action outline (dark green)
 _ARROW = _rgb(220, 0, 0)          # cursor arrow (red)
 _STATUS_BG = _rgb(40, 40, 40)     # status ribbon (dark)
 _STATUS_FG = _rgb(255, 255, 255)  # status text (white)
@@ -136,6 +139,38 @@ class GuideOverlay:
         cursor: tuple[int, int] | None = None,
         labels: list[tuple[int, str]] | None = None,
     ) -> None:
+        self._render(frames, target, status, cursor, labels,
+                     fill=_TARGET_FILL, edge=_TARGET_EDGE)
+
+    def flash(
+        self,
+        target: tuple[int, int, int, int] | None,
+        status: str,
+        cursor: tuple[int, int] | None = None,
+        frames: list[tuple[int, int, int, int]] | None = None,
+        labels: list[tuple[int, str]] | None = None,
+    ) -> None:
+        """'Confirmation' state: the target stays GREEN until the next plan draw replaces it.
+
+        2026-09-23 (#10): the plan draw answers "what WILL I click?", flash answers "that
+        just happened" — drawn AFTER the settle+verify, so it costs zero latency (it overlaps
+        the Jev think-time of the NEXT step, ~1 s) and the operator clearly sees the green
+        confirm block while the agent re-decides.
+        """
+        self._render(frames or [], target, status, cursor, labels,
+                     fill=_FLASH_FILL, edge=_FLASH_EDGE)
+
+    def _render(
+        self,
+        frames: list[tuple[int, int, int, int]],
+        target: tuple[int, int, int, int] | None,
+        status: str,
+        cursor: tuple[int, int] | None,
+        labels: list[tuple[int, str]] | None,
+        *,
+        fill: int,
+        edge: int,
+    ) -> None:
         if not self._dc_ok():
             return
         try:
@@ -161,8 +196,8 @@ class GuideOverlay:
                 tx2 = min(self._w, tx2)
                 ty2 = min(self._h, ty2)
                 if tx2 > tx1 and ty2 > ty1:
-                    self._fill(_TARGET_FILL, tx1, ty1, tx2, ty2)
-                    self._frame(_rgb(160, 0, 0), tx1, ty1, tx2, ty2, 2)
+                    self._fill(fill, tx1, ty1, tx2, ty2)
+                    self._frame(edge, tx1, ty1, tx2, ty2, 2)
             if cursor:
                 cx, cy = int(cursor[0]), int(cursor[1])
                 if 0 <= cx < self._w and 0 <= cy < self._h:
@@ -171,7 +206,7 @@ class GuideOverlay:
                 self._status(status)
             self._present()
         except Exception:
-            log.warning("guide draw failed", exc_info=True)
+            log.warning("guide render failed", exc_info=True)
 
     def close(self) -> None:
         try:
