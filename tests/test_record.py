@@ -9,7 +9,7 @@ from jev_computer_use.computer_use.record import (
     assemble_gif,
     captions,
 )
-from jev_computer_use.computer_use.run_agent import _abs_box, _local
+from jev_computer_use.computer_use.run_agent import _abs_box, _local, _record_step
 
 
 def _img(w: int = 300, h: int = 200) -> Image.Image:
@@ -110,3 +110,26 @@ def test_local_roundtrip_with_abs():
     pt = _abs_box((10, 20, 90, 60), origin)
     center = ((pt[0] + pt[2]) // 2, (pt[1] + pt[3]) // 2)
     assert _local(center, origin) == (50, 40)
+
+
+def test_record_step_writes_png_and_jsonl(tmp_path):
+    """Regression for the 2026-09-23 live run: the annotated PNG/D image was never written
+    because .save() was called on the Path, not the image ('WindowsPath' has no 'save')."""
+    from types import SimpleNamespace
+
+    shot = SimpleNamespace(img=Image.new("RGB", (300, 200), (64, 64, 64)),
+                           dhash=42)
+    entry = {"step": 1, "action": "click_element", "element_id": 3}
+    _record_step(tmp_path, shot, [_element(1, (10, 20, 90, 60), "Save Setup")],
+                 (10, 20, 90, 60), "plan: click", (60, 40), 1, entry)
+    assert (tmp_path / "step_001.png").exists()
+    lines = (tmp_path / "steps.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert '"element_id": 3' in lines[0]
+
+
+def test_record_step_none_dir_is_noop():
+    from types import SimpleNamespace
+
+    shot = SimpleNamespace(img=Image.new("RGB", (1, 1)), dhash=1)
+    _record_step(None, shot, [], None, "", None, 1, {"step": 1})  # must not raise

@@ -92,11 +92,21 @@ if ($fg -ne $target.Hwnd) {
     Write-Output "WARN: foreground lock not bypassed; OCR may see another window"
 }
 
-& "$proj\.venv\Scripts\jev-computer-use.exe" `
+# Recording: annotated PNG per step + a stitched GIF, so this demo doubles as the
+# --record/replay validation (see the replay line after the run).
+$rec = "$proj\demo-record-$(Get-Date -Format yyyyMMdd-HHmmss)"
+& "$proj\.venv\Scripts\python.exe" -m jev_computer_use.computer_use.run_agent `
     --goal "in the foreground Notepad window, type Hello, then save the file (Save As, filename n.txt)" `
     --approval none `
     --input-text "Hello" `
     --press-key "ctrl+s|ctrl+v|enter" `
+    --show-guide `
+    --record $rec `
     --max-steps 12
 
 Write-Output "exit code: $LASTEXITCODE"
+if (Test-Path "$rec\step_*.png") {
+    & "$proj\.venv\Scripts\python.exe" -m jev_computer_use.computer_use.run_agent replay $rec
+} else {
+    Write-Output "recording empty (no frame captured) at $rec"
+}

@@ -328,12 +328,13 @@ def _refocus(hwnd: int | None, retries: int = 1) -> bool:
     return win32.foreground_is(hwnd)
 
 
-def _step_capture(args, static_region: screen.Region | None) -> tuple[
+def _step_capture(args, static_region: screen.Region | None, guide=None) -> tuple[
         screen.Region | None, tuple[int, int], screen.Shot, int | None,
 ]:
     """Resolve --window (fresh every step: catches apps launched mid-run, window moves) or
     --region, then capture. Returns (region, origin, shot, hwnd). Raises _WindowNotFound when
-    --window matches nothing and AmbiguousWindowError when it matches several windows."""
+    --window matches nothing and AmbiguousWindowError when it matches several windows.
+    `guide` is hidden for the capture: the overlay must never be read into the inventory."""
     hwnd: int | None = None
     if args.window:
         w = win32.find_window(args.window)
@@ -351,6 +352,9 @@ def _step_capture(args, static_region: screen.Region | None) -> tuple[
     else:
         region = static_region
     origin = (region[0], region[1]) if region else (0, 0)
+    if guide is not None:
+        with guide.capture_ready():
+            return region, origin, screen.capture(region), hwnd
     return region, origin, screen.capture(region), hwnd
 
 
@@ -362,7 +366,7 @@ def _escape_pressed() -> bool:
         return False
 
 
-def _settle(args, region: screen.Region | None) -> screen.Shot:
+def _settle(args, region: screen.Region | None, guide=None) -> screen.Shot:
     """Adaptive post-action settle (#2): poll captures until the frame STOPS changing.
 
     arc-cua lesson: a fixed sleep is wrong twice — it burns wall-clock after fast repaints
@@ -381,7 +385,11 @@ def _settle(args, region: screen.Region | None) -> screen.Shot:
     stable = 0
     final: screen.Shot | None = None
     while True:
-        final = screen.capture(region)
+        if guide is not None:
+            with guide.capture_ready():
+                final = screen.capture(region)
+        else:
+            final = screen.capture(region)
         if last_dhash is not None and screen.hamming(last_dhash, final.dhash) <= qc.STUCK_DHASH:
             stable += 1
             if stable >= qc.SETTLE_FRAMES and (time.perf_counter() - started) >= min_s:
@@ -507,7 +515,7 @@ def _record_step(
         return
     try:
         annotated = record.annotate_frame(shot.img, elements, target=target, status=status, cursor=cursor)
-        (record_dir / f"step_{step:03d}.png").save(annotated)
+        annotated.save(record_dir / f"step_{step:03d}.png")
         with (record_dir / "steps.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as exc:
@@ -547,7 +555,7 @@ def _run_click_seq(args, static_region: screen.Region | None, step_log: list[dic
         step += 1
         log.info("click-seq step %d: click %r", step, target)
         try:
-            region, origin, shot, hwnd = _step_capture(args, static_region)
+            region, origin, shot, hwnd = _step_capture(args, static_region, guide)
         except _WindowNotFound as exc:
             _dump_escalate(str(exc), "")
             step_log.append({"step": step, "target": target, "action": "click_element",
@@ -620,7 +628,7 @@ def _run_click_seq(args, static_region: screen.Region | None, step_log: list[dic
             step_log.append(entry)
             return "blocked"
         act.click(click_pt)
-        after = _settle(args, region)
+        after = _settle(args, region, guide)
         diff = screen.hamming(before, after.dhash)
         entry["verify"] = {"dhash_diff": diff}
         print(f"  verify: dhash diff={diff}")
@@ -741,7 +749,7 @@ def _drive_goal(args, layer: DecisionLayer, static_region: screen.Region | None,
             break
         log.info("step %d: capturing + parsing", step)
         try:
-            region, origin, shot, hwnd = _step_capture(args, static_region)
+            region, origin, shot, hwnd = _step_capture(args, static_region, guide)
         except _WindowNotFound as exc:
             final_status = "blocked"
             last_reason = str(exc)
@@ -965,7 +973,7 @@ def _drive_goal(args, layer: DecisionLayer, static_region: screen.Region | None,
                                "(re-sending the whole string duplicates what arrived)", inventory)
                 break
 
-        after = _settle(args, region)
+        after = _settle(args, region, guide)
         diff = screen.hamming(before, after.dhash)
         entry["verify"] = {"dhash_diff": diff}
         print(f"  verify: dhash diff={diff}")

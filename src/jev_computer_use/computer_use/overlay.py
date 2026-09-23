@@ -67,16 +67,36 @@ _wndclass_registered = False
 _class_name = "JevGuideOverlay_W1"
 
 
+class _WNDCLASSW(ctypes.Structure):
+    """ctypes.wintypes does NOT ship WNDCLASSW on this build (AttributeError on
+    open() — discovered by the first real --show-guide run, 2026-09-23). Define it."""
+    _fields_ = [
+        ("style", ctypes.c_uint),
+        ("lpfnWndProc", ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_long)),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", ctypes.c_void_p),
+        ("hIcon", ctypes.c_void_p),
+        ("hCursor", ctypes.c_void_p),
+        ("hbrBackground", ctypes.c_void_p),
+        ("lpszMenuName", ctypes.c_wchar_p),
+        ("lpszClassName", ctypes.c_wchar_p),
+    ]
+
+
 def _ensure_class() -> None:
     global _wndclass_registered
     if _wndclass_registered:
         return
-    wc = wt.WNDCLASSW()
+    wc = _WNDCLASSW()
     wc.style = 0
-    wc.lpfnWndProc = _user32.DefWindowProcW
+    _user32.DefWindowProcW.restype = ctypes.c_void_p
+    wc.lpfnWndProc = ctypes.cast(_user32.DefWindowProcW, wc._fields_[1][1])
     wc.hInstance = _kernel32.GetModuleHandleW(None)
     wc.hCursor = _user32.LoadCursorW(None, 32512)  # IDC_ARROW
     wc.lpszClassName = _class_name
+    _user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
     _user32.RegisterClassW(ctypes.byref(wc))
     _wndclass_registered = True
 
@@ -130,6 +150,31 @@ class GuideOverlay:
             self._present()
         except Exception:
             log.warning("guide clear failed", exc_info=True)
+
+    def hide(self) -> None:
+        """Remove the overlay from the desktop (used around captures: the overlay must never
+        feed OCR — its ribbon/chips were read as elements on the first live --show-guide run,
+        2026-09-23, e.g. '#1 "/click_element (step 2,#4, diff=29)"')."""
+        if self._hwnd:
+            _user32.ShowWindow(self._hwnd, 0)
+
+    def show(self) -> None:
+        if self._hwnd:
+            _user32.ShowWindow(self._hwnd, _SW_SHOWNOACTIVATE)
+
+    def capture_ready(self):
+        """Context: overlay hidden for the duration of a screen capture, re-shown after."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _wrap():
+            self.hide()
+            try:
+                yield
+            finally:
+                self.show()
+
+        return _wrap()
 
     def draw(
         self,
@@ -300,7 +345,9 @@ class GuideOverlay:
             _gdi32.SetBkMode(self._dc, 1)  # TRANSPARENT
             _gdi32.SetTextColor(self._dc, _CHIP_FG)
             rc = wt.RECT(bx1 + 3, by1 + 2, bx2 - 3, by2 - 2)
-            _gdi32.DrawTextW(self._dc, text, -1, ctypes.byref(rc), 0x0000 | 0x0004 | 0x0100)  # left|top|noprefix
+            # DrawTextW lives in USER32 (not gdi32) — AttributeError on the first live
+            # --show-guide run, 2026-09-23, would blank every chip.
+            _user32.DrawTextW(self._dc, text, -1, ctypes.byref(rc), 0x0000 | 0x0004 | 0x0100)  # left|top|noprefix
             _gdi32.SelectObject(self._dc, old_font)
         finally:
             _gdi32.DeleteObject(font)
@@ -316,7 +363,7 @@ class GuideOverlay:
             _gdi32.SetBkColor(self._dc, _STATUS_BG)
             _gdi32.SetTextColor(self._dc, _STATUS_FG)
             rc = wt.RECT(8, 4, self._w - 8, 30)
-            _gdi32.DrawTextW(self._dc, text, -1, ctypes.byref(rc), 0x00A0 | 0x0004 | 0x0100)  # left|end|noprefix
+            _user32.DrawTextW(self._dc, text, -1, ctypes.byref(rc), 0x00A0 | 0x0004 | 0x0100)  # left|end|noprefix
             _gdi32.SelectObject(self._dc, old_font)
         finally:
             _gdi32.DeleteObject(font)
