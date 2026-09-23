@@ -213,3 +213,35 @@ def focus_window(hwnd: int, retries: int = 1) -> bool:
         if user32.GetForegroundWindow() == int(hwnd):
             return True
     return False
+
+
+def window_at(x: int, y: int) -> int:
+    """Top-level window at absolute screen point (0 if none)."""
+    pt = wt.POINT(int(x), int(y))
+    top = user32.WindowFromPoint(pt)
+    return int(top) if top else 0
+
+
+_GA_ROOT = 2  # GetAncestor(_GA_ROOT) -> the true top-level owner
+
+
+def root_owner(hwnd: int) -> int:
+    """Root owner window of a handle (walks child/popups up to the top-level)."""
+    root = user32.GetAncestor(hwnd, _GA_ROOT)
+    return int(root) if root else 0
+
+
+def point_owned_by(x: int, y: int, top_hwnd: int) -> bool:
+    """Is the pixel under (x, y) actually inside `top_hwnd`'s tree? (#5, occlusion guard)
+
+    2026-09-22 (arc-cua hit-test lesson): an always-on-top overlay, notification toast, or a
+    second app can sit above the target app physically while our rect/enum says the target is
+    focused. Clicking blind then lands IN the overlay. Before every click we resolve the
+    window under the pixel with WindowFromPoint and walk it to its GA_ROOT owner — if that
+    owner is not our target top-level, the click is DEFERRED (escalate flag) instead of fired.
+    WindowFromPoint already skips invisible/disabled windows, so the check is cheap (~10 us).
+    """
+    hit = window_at(int(x), int(y))
+    if not hit:
+        return False
+    return root_owner(hit) == int(top_hwnd)

@@ -15,6 +15,10 @@ SAFE_NOUL = 0.60          # safe_to_proceed noul must be >= this to act
 ACTION_CONF = 0.60        # next_action confidence >= this to act without escalation
 RISK_CONFIRM = 3          # step_risk score >= this forces --approval confirm if not already
 MAX_STEPS = 10            # hard loop cap
+# 2026-09-23 (tiptour JevGrounding lesson): explicit escape hatch + completion/absence gates,
+# all in the SAME batched call (zero added latency).
+TASK_DONE_NOUL = 0.85       # task_done noul >= this: a planned step is overridden to "done"
+CONTROL_ABSENT_NOUL = 0.80  # control_absent noul >= this + element "__none__": -> "blocked" (target absent)
 # STUCK_DHASH calibration 2026-09-22: 4 mis-flagged a real wizard transition
 # (License→Ready) as "no change"; with --window/--region crops the hash covers only the
 # target app so real changes score higher. 2 is too tight (cursor blink + tiny text edits
@@ -26,7 +30,18 @@ STUCK_TRIES = 3           # consecutive no-change actions before we declare stuc
 # or Jev). Most Win32/HTA/Electron UIs repaint within 100-300 ms; the dHash verify + stuck logic
 # still catch slow renders (a false "no change" just retries). For UWP/installers/wizard greeters
 # that paint late, raise at call time with --delay (e.g. 0.8). Never raised back to a fixed burn.
-STEP_DELAY = 0.3          # seconds between action and verification capture
+#
+# 2026-09-22 (arc-cua lesson): replace the FIXED sleep with a poll-to-stable settle — after a
+# mutating action the runtime re-observes until 2 stable frames, capped waits. Faster when the UI
+# settles quickly (return ASAP past the floor) and never acts too early on slow renders (the poll
+# simply keeps waiting). `--delay` now means "give slow UIs up to N seconds"; the floor guards the
+# settle instead of burning wall-clock on every step.
+STEP_DELAY = 0.3          # parse-time default for --delay (upper settle bound when tiny)
+SETTLE_MIN = 0.18         # minimum wait after a mutating action (UI repaint + focus settle)
+SETTLE_POLL = 0.05        # capture interval while waiting for stability (~30 ms each)
+SETTLE_TIMEOUT = 1.0      # hard cap per settle when --delay is not raised
+SETTLE_FRAMES = 2         # consecutive stable frames (dhash within STUCK_DHASH) = UI is ready
+WAIT_SECONDS = 0.3        # how long an explicit model WAIT pauses (capped by design)
 
 # --- click-seq deterministic drive (NO Jev): code-side risk gate (2026-09-22) ---
 # --click-seq clicks are user-authored, so the gate is a deterministic denylist instead of a
@@ -42,12 +57,16 @@ RISKY_CLICK_HINTS = (
 # paste_text = atomic clipboard paste (immune to layout/IME mangling). Prefer it for
 # punctuation-heavy or multi-line content — type_text mangles special chars on rich editors
 # (drive-screen live find: `test+^%~(){}[] 123` -> `test+^%~(333333333` in Win11 Notepad).
+# wait = explicit pause (WAIT_SECONDS) for slow disjoint UIs (splash screens, console apps):
+# cheaper and clearer than making Jev loop a "press_key Enter" gambit. Once a step returns a
+# change the stuck-across-tries guard still catches genuinely dead screens (arc-cua lesson).
 DEFAULT_ACTIONS: dict[str, str] = {
     "click_element": "Click the selected element",
     "type_text": "Type text into the selected element (short, layout-safe literals only)",
     "paste_text": "Paste text at the cursor via the clipboard (atomic, keeps punctuation/multi-line intact)",
     "press_key": "Press a special key (Enter, Tab, Esc, Ctrl+S, ...)",
     "scroll": "Scroll the current view",
+    "wait": "Pause a moment for the UI (splash, console, slow render), then re-check",
     "done": "The goal is complete",
     "blocked": "Stuck — no way to make progress with the available elements",
     "escalate": "Requires vision/reasoning a human or a VLM must provide",
@@ -55,10 +74,22 @@ DEFAULT_ACTIONS: dict[str, str] = {
 
 # Goal -> allowed action subset. Add rules here; the decide step only offers these options.
 GOAL_ACTION_MAP: dict[str, list[str]] = {
-    "form": ["click_element", "type_text", "paste_text", "press_key", "scroll", "done", "blocked", "escalate"],
-    "text": ["click_element", "type_text", "paste_text", "press_key", "scroll", "done", "blocked", "escalate"],
-    "browse": ["click_element", "type_text", "paste_text", "press_key", "scroll", "done", "blocked", "escalate"],
-    "default": ["click_element", "type_text", "paste_text", "press_key", "scroll", "done", "blocked", "escalate"],
+    "form": [
+        "click_element", "type_text", "paste_text", "press_key", "scroll", "wait",
+        "done", "blocked", "escalate",
+    ],
+    "text": [
+        "click_element", "type_text", "paste_text", "press_key", "scroll", "wait",
+        "done", "blocked", "escalate",
+    ],
+    "browse": [
+        "click_element", "type_text", "paste_text", "press_key", "scroll", "wait",
+        "done", "blocked", "escalate",
+    ],
+    "default": [
+        "click_element", "type_text", "paste_text", "press_key", "scroll", "wait",
+        "done", "blocked", "escalate",
+    ],
 }
 
 RISK_LEVELS = [

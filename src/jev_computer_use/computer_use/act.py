@@ -15,6 +15,8 @@ from collections.abc import Callable
 
 import pyautogui
 
+from . import questions_computer_use as qc
+
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.1
 
@@ -42,6 +44,17 @@ def click(center: tuple[int, int], *, button: str = "left", times: int = 1) -> N
 
 def double_click(center: tuple[int, int]) -> None:
     pyautogui.doubleClick(*center)
+
+
+def aim(center: tuple[int, int], duration: float = 0.06) -> None:
+    """Glide the OS cursor onto the target WITHOUT clicking.
+
+    2026-09-23 (tiptour pointer-mark lesson): the operator SEES the agent aim at the
+    element before every keyboard/scroll action, not just clicks (pyautogui moves the
+    cursor for clicks on its own). Hover alone never changes focus, so this is purely
+    visual; keep the glide short so it costs ~60 ms, not a pause.
+    """
+    pyautogui.moveTo(center[0], center[1], duration=duration)
 
 
 def validate_key(key: str) -> tuple[str, ...]:
@@ -194,6 +207,9 @@ def execute(
         press(key)
     elif action == "scroll":
         scroll(1, center)
+    elif action == "wait":
+        # explicit pause for splash/console/slow disjoint UIs — bounded, never a live model loop
+        time.sleep(qc.WAIT_SECONDS)
     elif action in ("done", "blocked", "escalate"):
         return  # no-op; terminal actions handled by the loop
     else:

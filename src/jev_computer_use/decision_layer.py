@@ -35,6 +35,21 @@ OPENROUTER_MODEL = "typesafe/jev-1.13"
 
 load_dotenv()  # project-local .env (keys never committed; canonical store = api-providers.md)
 
+# Shared keep-alive transport. 2026-09-22 (jev-ultrafast lesson): per-call httpx.post() rebuilt
+# DNS + TCP + TLS on every decision (~150-400 ms of pure overhead per step) and starved the
+# machine of sockets. One pooled client (HTTP/2 when the `h2` package is present, clean fallback
+# otherwise) is reused by ALL providers AND the optional text-helper for the whole process.
+_TRANSPORT_TIMEOUT = 30.0
+try:
+    _CLIENT = httpx.Client(http2=True, timeout=_TRANSPORT_TIMEOUT)
+except Exception:
+    _CLIENT = httpx.Client(timeout=_TRANSPORT_TIMEOUT)
+
+
+def session() -> httpx.Client:
+    """Return the shared pooled client (decision providers + text-helper)."""
+    return _CLIENT
+
 
 class ProviderError(Exception):
     """A single channel failed (transient or auth/input). Cascade should move on."""
@@ -130,7 +145,7 @@ def _retrying_post(
     headers = _headers(api_key)
     attempt = 0
     while True:
-        r = httpx.post(url, json=json, headers=headers, timeout=timeout)
+        r = _CLIENT.post(url, json=json, headers=headers, timeout=timeout)
         if r.status_code in (429, 529) and attempt < retries:
             attempt += 1
             log.warning("Jev provider overloaded (%s) — retry %d", r.status_code, attempt)
@@ -200,11 +215,11 @@ class CloudflareProvider(BaseProvider):
             "questions": {q.key: q.to_api() for q in questions},
         }
         url = CLOUDFLARE_RUN_URL.format(account_id=self.account_id)
-        r = httpx.post(url, json={"model": model_name, "input": input_payload},
-                       headers=_headers(self.api_token), timeout=60.0)
+        r = _CLIENT.post(url, json={"model": model_name, "input": input_payload},
+                         headers=_headers(self.api_token), timeout=60.0)
         if r.status_code in (404, 400, 405):  # some accounts require model in the path
             fallback = f"{url}/{model_name}"
-            r = httpx.post(fallback, json=input_payload, headers=_headers(self.api_token), timeout=60.0)
+            r = _CLIENT.post(fallback, json=input_payload, headers=_headers(self.api_token), timeout=60.0)
         if r.status_code >= 400:
             raise ProviderError(f"cloudflare: HTTP {r.status_code}: {r.text[:300]}")
         data = r.json()
@@ -235,7 +250,7 @@ class OpenRouterProvider(BaseProvider):
             "questions": {q.key: q.to_api() for q in questions},
             "provider": {"allow_fallbacks": True},
         }
-        r = httpx.post(OPENROUTER_URL, json=payload, headers=_headers(self.api_key), timeout=60.0)
+        r = _CLIENT.post(OPENROUTER_URL, json=payload, headers=_headers(self.api_key), timeout=60.0)
         if r.status_code == 402:
             raise ProviderError("openrouter: 402 Payment Required (needs prepaid credits)")
         if r.status_code >= 400:
@@ -322,6 +337,63 @@ def _normalize(data: dict[str, Any], provider: str) -> DecisionResponse:
     return DecisionResponse(answers=answers, provider=provider, model=model, usage=usage)
 
 
+def _as_number(value: Any, label: str) -> float:
+    """Coerce to a finite float or raise a ProviderError (bool is rejected on purpose)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ProviderError(f"malformed {label}: {value!r}")
+    return float(value)
+
+
+def _validate_response(resp: DecisionResponse, questions: list[Question]) -> None:
+    """Structural validation of a provider's answers (#7, jev-ultrafast lesson).
+
+    Deliberately TOLERANT so the cascade keeps working: an answer that is present must have the
+    right SHAPE (choice within the offered options, numbers inside range, probabilities sane),
+    but a gateway may omit a question entirely — decide_plan defaults those. A malformed answer
+    raises ProviderError so DecisionLayer fails over to the next channel instead of acting on
+    garbage (a hallucinated element id or an out-of-range score is worse than a retry).
+    """
+    if not questions:
+        return
+    by_key = resp.by_key()
+    for q in questions:
+        ans = by_key.get(q.key)
+        if ans is None:
+            continue  # tolerated omission (gateway batching); decide_plan applies its default
+        if q.type == "choice":
+            keys = list(q.criteria.keys()) if isinstance(q.criteria, dict) else [q.criteria]
+            if ans.choice is not None and ans.choice not in keys:
+                raise ProviderError(f"answer {q.key!r} chose unmatched option {ans.choice!r} (offered {keys})")
+            _validate_probabilities(ans, keys, q.key)
+        if q.type == "score" and ans.score is not None and isinstance(q.criteria, list):
+            s = _as_number(ans.score, f"{q.key}.score")
+            if not 0 <= s <= len(q.criteria) - 1:
+                raise ProviderError(f"answer {q.key!r} score {s} outside 0..{len(q.criteria) - 1}")
+        if q.type == "noul" and ans.noul is not None:
+            n = _as_number(ans.noul, f"{q.key}.noul")
+            if not 0.0 <= n <= 1.0:
+                raise ProviderError(f"answer {q.key!r} noul {n} outside 0..1")
+        if ans.confidence is not None:
+            c = _as_number(ans.confidence, f"{q.key}.confidence")
+            if not 0.0 <= c <= 1.0:
+                raise ProviderError(f"answer {q.key!r} confidence {c} outside 0..1")
+
+
+def _validate_probabilities(ans: Answer, keys: list[str], q_key: str) -> None:
+    probs = ans.probabilities
+    if not isinstance(probs, dict) or not probs:
+        return
+    for k, v in probs.items():
+        _as_number(v, f"{q_key}.probabilities[{k!r}]")
+    covered = set(probs)
+    if covered == set(keys):
+        total = sum(float(p) for p in probs.values())
+        if not 0.95 <= total <= 1.05:
+            raise ProviderError(f"answer {q_key!r} probabilities sum {total:.3f} != 1.0")
+        if ans.choice is not None and ans.choice != max(probs, key=probs.get):
+            raise ProviderError(f"answer {q_key!r} choice {ans.choice!r} != argmax {max(probs, key=probs.get)!r}")
+
+
 class DecisionLayer:
     """Fails over across providers per call; returns the first full success."""
 
@@ -356,6 +428,7 @@ class DecisionLayer:
             try:
                 started = time.perf_counter()
                 resp = provider.ask(state, questions, model=model)
+                _validate_response(resp, list(questions))
                 resp.latency_ms = round((time.perf_counter() - started) * 1000, 1)
                 log.info("Jev decision served by %s (%s) in %sms",
                          provider.name, resp.model, resp.latency_ms)

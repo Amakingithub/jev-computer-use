@@ -40,14 +40,17 @@ def build_questions(
     options = {str(e.id): e.to_state_line() for e in elements}
     if not options:
         options = {"none": "no elements detected on screen"}
+    options["__none__"] = "None of these elements would advance the goal (the needed control is absent or misread)"
     options["nonew"] = "act on the currently focused window (no element click needed)"
     qs = [
         choice(
             key="which_element",
             instructions=(
-                "Which screen element should this task act on? 'nonew' = act on the currently "
-                "focused window (right for typing or keyboard shortcuts, which do not need a "
-                "coordinate click). Pick a listed element only when the action must physically "
+                "Which screen element should this task act on? Choose exactly the element that makes "
+                "progress toward the goal. '__none__' = none of the listed elements is the control "
+                "you need (the goal expects something not currently on screen). 'nonew' = act on the "
+                "currently focused window (right for typing or keyboard shortcuts, which do not need "
+                "a coordinate click). Pick a listed element only when the action must physically "
                 "target that UI control."
             ),
             options=options,
@@ -56,6 +59,29 @@ def build_questions(
             key="next_action",
             instructions="Which action should run next to make progress on the goal?",
             options=qc.actions_for(goal),
+        ),
+        noul(
+            key="task_done",
+            instructions=(
+                "Judging ONLY from the screen text above and your own previous steps, is the GOAL "
+                "already fully completed — its result already visible on screen, nothing more needed?"
+            ),
+            criteria={
+                "true": "Every requirement of the goal is visibly done on screen",
+                "false": "At least one requirement is still missing, or its completion is unverified",
+            },
+        ),
+        noul(
+            key="control_absent",
+            instructions=(
+                "Is the UI control the goal needs NEXT genuinely absent from the screen — not just "
+                "misread, but impossible to reach with any listed element or a keyboard shortcut?"
+            ),
+            criteria={
+                "true": "The needed control is not among the listed elements and cannot be opened or used",
+                "false": "The needed control is listed, or reachable by keyboard, or only "
+                         "briefly hidden (menu/dialog not yet opened)",
+            },
         ),
         noul(
             key="safe_to_proceed",
@@ -102,12 +128,21 @@ def decide_plan(
 
     action = answers["next_action"].choice or "escalate"
     action_conf = answers["next_action"].confidence
-    element_id = None
+
+    def _noul(key: str) -> float | None:
+        ans = answers.get(key)
+        return ans.noul if ans is not None else None  # a gateway may reply noul:null
+
+    task_done_noul = _noul("task_done")
+    absent_noul = _noul("control_absent")
+    task_done = task_done_noul is not None and task_done_noul >= qc.TASK_DONE_NOUL
+    control_absent = absent_noul is not None and absent_noul >= qc.CONTROL_ABSENT_NOUL
+
     elem_choice = answers.get("which_element")
+    none_chosen = bool(elem_choice and elem_choice.choice == "__none__")
+    element_id = None
     if elem_choice and elem_choice.choice and elem_choice.choice.isdigit():
-        element_id = int(elem_choice.choice)
-    if elem_choice and elem_choice.choice in ("nonew", "none"):
-        element_id = None  # act on the focused window / viewport
+        element_id = int(elem_choice.choice)  # nonew / none / __none__: element_id stays None
     safe = bool(answers.get("safe_to_proceed") and answers["safe_to_proceed"].noul >= qc.SAFE_NOUL)
     risk = answers.get("step_risk") and answers["step_risk"].score
 
@@ -116,8 +151,17 @@ def decide_plan(
         or (risk is not None and risk >= qc.RISK_CONFIRM)
     )
 
+    # tiptour JevGrounding gates: never act on "none of these", stop early when already done.
     reason = "ok"
-    if action in ("blocked", "escalate"):
+    if none_chosen and not task_done and action not in ("blocked", "escalate"):
+        action = "blocked"
+        reason = "model chose '__none__' — no element advances the goal" + (
+            f" (control_absent={absent_noul:.2f})" if control_absent else ""
+        )
+    elif task_done and action not in ("blocked", "escalate", "done"):
+        action = "done"
+        reason = f"task_done gate ({task_done_noul:.2f} >= {qc.TASK_DONE_NOUL}) — goal already complete"
+    elif action in ("blocked", "escalate"):
         reason = f"model chose {action!r}: " + (qc.DEFAULT_ACTIONS.get(action) or action)
     elif not safe:
         reason = f"risk gate failed (noul={answers['safe_to_proceed'].noul:.2f} < {qc.SAFE_NOUL})"

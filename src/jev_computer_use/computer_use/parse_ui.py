@@ -67,6 +67,7 @@ class Element:
     box: tuple[int, int, int, int]  # x1, y1, x2, y2
     score: float
     source: str = "ocr"  # which provider produced this element
+    role: str = ""  # UIA ControlType (arc-cua): "ButtonControl", "EditControl", … — "" from OCR
 
     @property
     def center(self) -> tuple[int, int]:
@@ -82,7 +83,7 @@ class Element:
 
 
 RawBox = tuple[int, int, int, int]  # x1, y1, x2, y2 (absolute screen coords)
-RawRead = tuple[str, RawBox, float]  # (text, box, score)
+RawRead = tuple[str, RawBox, float, str]  # (text, box, score, role) — role = "" unless a11y
 
 
 def _a11y_region(origin: tuple[int, int], img: Image.Image) -> RawBox | None:
@@ -143,7 +144,7 @@ class RapidOCRProvider(BaseProvider):
             xs = [float(p[0]) for p in box]
             ys = [float(p[1]) for p in box]
             int_box = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
-            reads.append((str(text), int_box, float(score)))
+            reads.append((str(text), int_box, float(score), ""))
         return reads
 
 
@@ -169,7 +170,7 @@ class WindowsOCRProvider(BaseProvider):
             x1, y1, x2, y2 = box
             if x2 <= x1 or y2 <= y1:  # empty/degenerate box
                 continue
-            reads.append((text, (x1, y1, x2, y2), 1.0))
+            reads.append((text, (x1, y1, x2, y2), 1.0, ""))
         return reads
 
 
@@ -202,7 +203,7 @@ class GLMOcrProvider(BaseProvider):
             ys = [p[1] for p in (item.get("box") or [])]
             if xs and ys:
                 box = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
-                reads.append((text, box, float(item.get("score", 1.0))))
+                reads.append((text, box, float(item.get("score", 1.0)), ""))
         return reads
 
 
@@ -250,14 +251,14 @@ def _uia11y_reads(origin: RawBox = (0, 0), region: RawBox | None = None) -> list
     started = _time.perf_counter()
     ctx = {"root": uia.GetRootControl(), "reads": [], "seen": set(), "nodes": 0}
 
-    def emit(text: str, box: RawBox) -> None:
+    def emit(text: str, box: RawBox, role: str = "") -> None:
         # UIA walks both the caption-window and its content tree → identical controls
         # (same text + same box) can appear twice; collapse to one read.
         key = (text, box)
         if key in ctx["seen"]:
             return
         ctx["seen"].add(key)
-        ctx["reads"].append((text, box, 1.0))
+        ctx["reads"].append((text, box, 1.0, role))
 
     def in_region(rect) -> bool:
         if region is None:
@@ -291,7 +292,7 @@ def _uia11y_reads(origin: RawBox = (0, 0), region: RawBox | None = None) -> list
             text = _safe_uia_name(getattr(ctrl, "Name", "") or "")
             if text:
                 ox, oy = origin
-                emit(text, (int(x1 - ox), int(y1 - oy), int(x2 - ox), int(y2 - oy)))
+                emit(text, (int(x1 - ox), int(y1 - oy), int(x2 - ox), int(y2 - oy)), ctype)
         try:
             for child in ctrl.GetChildren():
                 visit(child, depth + 1)
@@ -426,10 +427,16 @@ def _to_elements(reads: list[RawRead], *, source: str, max_elements: int) -> lis
     # Sort by (top, left, text) so ids are STABLE across re-captures of an unchanged
     # screen: OCR/read detection order can jitter between frames, which shifted element
     # ids and made Jev re-pick stale targets (2026-09-22 wizard test: conf 0.95→0.53).
-    valid = [(str(t).strip(), b, s) for (t, b, s) in reads if str(t).strip() and b is not None]
+    valid: list[tuple[str, RawBox, float, str]] = []
+    for raw in reads:
+        t, b, s = raw[0], raw[1], raw[2]
+        role = raw[3] if len(raw) > 3 else ""  # pre-2026-09-23 3-tuples stay accepted
+        if str(t).strip() and b is not None:
+            valid.append((str(t).strip(), b, s, role))
     ordered = sorted(valid, key=lambda r: (r[1][1], r[1][0], r[0].lower()))
-    for i, (text, box, score) in enumerate(ordered):
-        elements.append(Element(id=i + 1, text=text, box=box, score=float(score), source=source))
+    for i, (text, box, score, role) in enumerate(ordered):
+        elements.append(Element(id=i + 1, text=text, box=box, score=float(score),
+                                source=source, role=role))
         if len(elements) >= max_elements:
             break
     return elements
@@ -464,6 +471,82 @@ def _merge_gap_fill(primary: list[Element], secondary: list[Element], max_elemen
         e.id = fresh_id
         out.append(e)
         seen_text.add(key)
+    return out
+
+
+def changed_region(
+    prev: np.ndarray,
+    cur: np.ndarray,
+    *,
+    threshold: int = 24,
+    min_fraction: float = 0.0005,
+    max_fraction: float = 0.25,
+    pad: int = 6,
+) -> RawBox | None:
+    """Bounding box (image-local) of pixels that changed between two equal-size L8 frames.
+
+    2026-09-23 (tiptour frame-skip, refined): the change-box reparse. Returns None when the
+    frames are identical or the changed area is outside [min_fraction, max_fraction] — too
+    tiny (cursor blink / mss noise) or too big (real layout change → full reparse). Padded
+    so a crop-edge OCR doesn't clip glyphs. Used to re-OCR ONLY the region that moved.
+    """
+    if prev.shape != cur.shape or prev.size == 0:
+        return None
+    diff = np.abs(prev.astype(np.int16) - cur.astype(np.int16)) >= threshold
+    frac = int(diff.sum()) / prev.size
+    if frac < min_fraction or frac > max_fraction:
+        return None
+    ys, xs = np.nonzero(diff)
+    h, w = cur.shape
+    x1 = max(0, int(xs.min()) - pad)
+    y1 = max(0, int(ys.min()) - pad)
+    x2 = min(w, int(xs.max()) + 1 + pad)
+    y2 = min(h, int(ys.max()) + 1 + pad)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def shift_elements(elements: list[Element], dx: int, dy: int) -> list[Element]:
+    """Translate element boxes by (dx, dy) — used to bring crop-local OCR back to capture-local."""
+    out: list[Element] = []
+    for e in elements:
+        x1, y1, x2, y2 = e.box
+        out.append(Element(e.id, e.text, (x1 + dx, y1 + dy, x2 + dx, y2 + dy), e.score, e.source, e.role))
+    return out
+
+
+def incremental_merge(
+    prev: list[Element],
+    fresh: list[Element],
+    changed_box: RawBox,
+    *,
+    max_elements: int = 40,
+) -> list[Element]:
+    """Union the previous inventory's unchanged elements with fresh reads of the changed box.
+
+    2026-09-23 (change-box reparse): prev boxes are capture-local, fresh boxes are
+    capture-local too (caller shifts crop reads). Any prev element intersecting the change
+    box is dropped (it may have moved/changed); fresh re-reads only that region. Ids are
+    re-numbered with the same (top, left, text) sort as `_to_elements`, and an overlap>0.6
+    dedup mirrors `_merge_gap_fill` so a text straddling the crop edge can't double-read.
+    """
+    cx1, cy1, cx2, cy2 = changed_box
+
+    def _intersects(e: Element) -> bool:
+        x1, y1, x2, y2 = e.box
+        return not (x2 <= cx1 or x1 >= cx2 or y2 <= cy1 or y1 >= cy2)
+
+    pool = [e for e in prev if not _intersects(e)] + list(fresh)
+    pool.sort(key=lambda e: (e.box[1], e.box[0], e.text.lower()))
+    out: list[Element] = []
+    for e in pool:
+        if len(out) >= max_elements:
+            break
+        if any(_overlap_ratio(e.box, o.box) > 0.6 for o in out):
+            continue
+        e.id = len(out) + 1
+        out.append(e)
     return out
 
 
